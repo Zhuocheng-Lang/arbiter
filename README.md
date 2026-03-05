@@ -1,5 +1,7 @@
 # arbiter
 
+[English](README.md) | [简体中文](README_ZH_CN.md)
+
 > A non-intrusive process priority manager for Linux, designed as a companion to modern `sched_ext` (scx) schedulers.
 
 Arbiter sits alongside your scx scheduler and applies per-process `nice`, `ionice`, `cgroup`, and `oom_score_adj` tuning based on community-maintained rule sets — fully compatible with the [Ananicy-cpp](https://gitlab.com/ananicy-cpp/ananicy-cpp) rule format, with extensions for scx-aware environments.
