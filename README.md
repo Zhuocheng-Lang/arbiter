@@ -4,8 +4,6 @@
 
 Arbiter sits alongside your scx scheduler and applies per-process `nice`, `ionice`, `cgroup`, and `oom_score_adj` tuning based on community-maintained rule sets — fully compatible with the [Ananicy-cpp](https://gitlab.com/ananicy-cpp/ananicy-cpp) rule format, with extensions for scx-aware environments.
 
----
-
 ## Why arbiter?
 
 Modern scx schedulers (`scx_lavd`, `scx_bpfland`, `scx_rustland`, etc.) take over CPU scheduling entirely. This means classic CFS-based priority tuning tools lose much of their effect — and most of them don't even know scx is running.
@@ -24,8 +22,6 @@ Arbiter is designed with scx as a first-class consideration:
 | Coexistence with scx | Unaware | Designed for it |
 
 Arbiter does **not** replace your scx scheduler. It adjusts the process attributes that scx schedulers expose to userspace and use as hints — `p->scx.weight` (derived from nice), IO priority, and cgroup hierarchy — without interfering with scheduling decisions.
-
----
 
 ## Features
 
@@ -48,8 +44,6 @@ Arbiter does **not** replace your scx scheduler. It adjusts the process attribut
 Arbiter is designed as a **replacement** for Ananicy-cpp in scx environments, not a companion. Running both simultaneously will cause conflicts (both will renice the same processes). If you use arbiter, disable ananicy-cpp.
 
 The Ananicy-cpp community rule files (from [ananicy-rules](https://github.com/CachyOS/ananicy-rules) and similar repos) are directly usable with arbiter — this is an explicit design goal.
-
----
 
 ## License
 
