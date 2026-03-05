@@ -1,0 +1,15 @@
+# Steam, Proton and Wine game processes
+{ "name": "steam",           "type": "GameServer" }
+{ "name": "steamwebhelper",  "type": "BgTask"     }
+{ "name": "steamwebhelper",  "type": "BgTask"     }
+{ "name": "steam_osx",       "type": "BgTask"     }
+{ "name": "steam_linux_runt","type": "BgTask"     }
+{ "name": "proton",          "type": "Game"       }
+{ "name": "wine",            "type": "Game"       }
+{ "name": "wine64",          "type": "Game"       }
+{ "name": "wineserver",      "type": "GameServer" }
+{ "name": "wine-preloader",  "type": "BgTask"     }
+{ "name": "GameMode",        "type": "Daemon"     }
+{ "name": "gamemoderun",     "type": "Game"       }
+# Pressure-vessel (Steam Runtime container)
+{ "name": "pressure-vessel", "type": "BgTask"     }

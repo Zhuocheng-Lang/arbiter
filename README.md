@@ -10,16 +10,16 @@ Modern scx schedulers (`scx_lavd`, `scx_bpfland`, `scx_rustland`, etc.) take ove
 
 Arbiter is designed with scx as a first-class consideration:
 
-| | Ananicy-cpp | arbiter |
-|---|---|---|
-| Rule format | Own format | Compatible with Ananicy-cpp rules |
-| Process detection | polls / Netlink / BPF | Netlink `PROC_EVENT_EXEC` (~1 ms) |
-| scx awareness | ✗ | ✓ Detects active scx scheduler |
-| `ionice` / `oom_score_adj` | ✓ | ✓ |
-| `nice` tuning | ✓ | ✓ (with scx weight propagation notes) |
-| cgroup placement | systemd slice | ✓ + scx_layered-aware mode |
-| Runtime | C++ | Rust |
-| Coexistence with scx | Unaware | Designed for it |
+|                            | Ananicy-cpp           | arbiter                               |
+| -------------------------- | --------------------- | ------------------------------------- |
+| Rule format                | Own format            | Compatible with Ananicy-cpp rules     |
+| Process detection          | polls / Netlink / BPF | Netlink `PROC_EVENT_EXEC` (~1 ms)     |
+| scx awareness              | ✗                     | ✓ Detects active scx scheduler        |
+| `ionice` / `oom_score_adj` | ✓                     | ✓                                     |
+| `nice` tuning              | ✓                     | ✓ (with scx weight propagation notes) |
+| cgroup placement           | systemd slice         | ✓ + scx_layered-aware mode            |
+| Runtime                    | C++                   | Rust                                  |
+| Coexistence with scx       | Unaware               | Designed for it                       |
 
 Arbiter does **not** replace your scx scheduler. It adjusts the process attributes that scx schedulers expose to userspace and use as hints — `p->scx.weight` (derived from nice), IO priority, and cgroup hierarchy — without interfering with scheduling decisions.
 
@@ -33,7 +33,7 @@ Arbiter does **not** replace your scx scheduler. It adjusts the process attribut
 - **Extended rule format** — Optional arbiter-specific fields for finer control, fully backwards-compatible
 - **Low overhead** — Written in Rust; event-driven architecture with negligible CPU usage at idle
 
-## Requirements:
+## Requirements
 
 - Linux kernel ≥ 6.12 (for `sched_ext` support; arbiter also works without scx)
 - `CAP_NET_ADMIN` and `CAP_SYS_NICE` (or run as root)

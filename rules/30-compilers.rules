@@ -1,0 +1,24 @@
+# Compilers, build tools — low-priority background tasks
+{ "name": "cargo",    "type": "BgTask" }
+{ "name": "rustc",    "type": "BgTask" }
+{ "name": "cc",       "type": "BgTask" }
+{ "name": "c++",      "type": "BgTask" }
+{ "name": "gcc",      "type": "BgTask" }
+{ "name": "g++",      "type": "BgTask" }
+{ "name": "clang",    "type": "BgTask" }
+{ "name": "clang++",  "type": "BgTask" }
+{ "name": "make",     "type": "BgTask" }
+{ "name": "ninja",    "type": "BgTask" }
+{ "name": "cmake",    "type": "BgTask" }
+{ "name": "meson",    "type": "BgTask" }
+{ "name": "makepkg",  "type": "BgTask" }
+{ "name": "tsc",      "type": "BgTask" }
+{ "name": "go",       "type": "BgTask" }
+{ "name": "javac",    "type": "BgTask" }
+{ "name": "mvn",      "type": "BgTask" }
+{ "name": "gradle",   "type": "BgTask" }
+{ "name": "bazel",    "type": "BgTask" }
+{ "name": "ld",       "type": "BgTask" }
+{ "name": "lld",      "type": "BgTask" }
+{ "name": "mold",     "type": "BgTask" }
+{ "name": "gold",     "type": "BgTask" }

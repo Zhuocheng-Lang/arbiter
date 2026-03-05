@@ -1,0 +1,13 @@
+# Browsers
+{ "name": "firefox",         "type": "Browser" }
+{ "name": "firefox-bin",     "type": "Browser" }
+{ "name": "firefox-esr",     "type": "Browser" }
+{ "name": "chromium",        "type": "Browser" }
+{ "name": "chromium-browser","type": "Browser" }
+{ "name": "chrome",          "type": "Browser" }
+{ "name": "google-chrome",   "type": "Browser" }
+{ "name": "brave",           "type": "Browser" }
+{ "name": "brave-browser",   "type": "Browser" }
+{ "name": "vivaldi",         "type": "Browser" }
+{ "name": "opera",           "type": "Browser" }
+{ "name": "msedge",          "type": "Browser" }

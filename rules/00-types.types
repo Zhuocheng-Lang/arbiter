@@ -1,0 +1,10 @@
+# arbiter type definitions (ananicy-cpp compatible JSON-per-line format)
+# Fields: type, nice, ioclass, ionice, oom_score_adj, cgroup, cgroup_weight
+
+{ "type": "Game",       "nice": -10, "ioclass": "best-effort", "ionice": 0,  "oom_score_adj": -300, "cgroup": "gaming.slice",     "cgroup_weight": 900  }
+{ "type": "GameServer", "nice": -5,  "ioclass": "best-effort", "ionice": 0,  "oom_score_adj": -200, "cgroup": "gaming.slice",     "cgroup_weight": 700  }
+{ "type": "Daemon",     "nice":  0,  "ioclass": "best-effort", "ionice": 4,  "oom_score_adj":    0, "cgroup": "system.slice",     "cgroup_weight": 100  }
+{ "type": "BgTask",     "nice": 10,  "ioclass": "idle",        "ionice": 7,  "oom_score_adj":  200, "cgroup": "background.slice", "cgroup_weight":  50  }
+{ "type": "Browser",    "nice":  0,  "ioclass": "best-effort", "ionice": 4,  "oom_score_adj":    0, "cgroup": "desktop.slice",    "cgroup_weight": 200  }
+{ "type": "Desktop",    "nice":  0,  "ioclass": "best-effort", "ionice": 4,  "oom_score_adj": -100, "cgroup": "desktop.slice",    "cgroup_weight": 300  }
+{ "type": "Audio",      "nice": -5,  "ioclass": "real-time",   "ionice": 4,  "oom_score_adj": -500, "cgroup": "desktop.slice",    "cgroup_weight": 800  }

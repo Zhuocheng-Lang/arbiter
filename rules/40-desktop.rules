@@ -1,0 +1,19 @@
+# Desktop environment processes — promote interactivity
+{ "name": "plasmashell",   "type": "Desktop" }
+{ "name": "kwin_wayland",  "type": "Desktop" }
+{ "name": "kwin_x11",      "type": "Desktop" }
+{ "name": "ksmserver",     "type": "Desktop" }
+{ "name": "gnome-shell",   "type": "Desktop" }
+{ "name": "mutter",        "type": "Desktop" }
+{ "name": "Xorg",          "type": "Desktop" }
+{ "name": "Xwayland",      "type": "Desktop" }
+{ "name": "sway",          "type": "Desktop" }
+{ "name": "hyprland",      "type": "Desktop" }
+{ "name": "wayfire",       "type": "Desktop" }
+# Audio — hard real-time class
+{ "name": "pipewire",      "type": "Audio"   }
+{ "name": "pipewire-pulse","type": "Audio"   }
+{ "name": "wireplumber",   "type": "Audio"   }
+{ "name": "pulseaudio",    "type": "Audio"   }
+{ "name": "jackd",         "type": "Audio"   }
+{ "name": "jackdbus",      "type": "Audio"   }
