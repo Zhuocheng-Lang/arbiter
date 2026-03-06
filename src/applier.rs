@@ -162,7 +162,7 @@ impl Applier {
         let mut val_buf = [0u8; 8];
         let val_len = {
             let mut c = Cursor::new(&mut val_buf[..]);
-            write!(c, "{score}\n").expect("val_buf too small");
+            writeln!(c, "{score}").expect("val_buf too small");
             c.position() as usize
         };
         let flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
@@ -192,7 +192,7 @@ impl Applier {
         let mut pid_buf = [0u8; 12]; // u32 max (4294967295) + '\n' = 11 bytes
         let pid_len = {
             let mut c = Cursor::new(&mut pid_buf[..]);
-            write!(c, "{pid}\n").expect("pid_buf too small");
+            writeln!(c, "{pid}").expect("pid_buf too small");
             c.position() as usize
         };
 
@@ -204,7 +204,7 @@ impl Applier {
             let mut wgt_buf = [0u8; 8]; // "10000\n" = 6 bytes
             let wgt_len = {
                 let mut c = Cursor::new(&mut wgt_buf[..]);
-                write!(c, "{w}\n").expect("wgt_buf too small");
+                writeln!(c, "{w}").expect("wgt_buf too small");
                 c.position() as usize
             };
             match self.write_control_file(&cg_dir, c"cpu.weight", &wgt_buf[..wgt_len]) {
