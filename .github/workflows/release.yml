@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  CARGO_TERM_COLOR: always
+  BINARY_NAME: arbiter
+
+jobs:
+  build-release:
+    name: Build & Publish Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --verbose
+
+      - name: Package binary
+        run: |
+          mkdir -p dist
+          cp target/release/${{ env.BINARY_NAME }} dist/
+          cp LICENSE dist/
+          tar -czf ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz \
+            -C dist \
+            ${{ env.BINARY_NAME }} \
+            LICENSE
+
+      - name: Calculate SHA256
+        id: sha256
+        run: |
+          echo "sum=$(sha256sum ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz | awk '{ print $1 }')" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.BINARY_NAME }}-${{ steps.version.outputs.version }}-x86_64-linux.tar.gz
+          generate_release_notes: true
+
+      - name: Update PKGBUILD
+        run: |
+          VERSION=${{ steps.version.outputs.version }}
+          SHA256=${{ steps.sha256.outputs.sum }}
+          sed -i "s/^pkgver=.*/pkgver=${VERSION}/" packaging/aur/PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" packaging/aur/PKGBUILD
+          sed -i "s/^sha256sums=.*/sha256sums=('${SHA256}')/" packaging/aur/PKGBUILD
+
+      - name: Publish to AUR
+        uses: KSXGitHub/github-actions-deploy-aur@v3.0.2
+        with:
+          pkgname: arbiter-bin
+          pkgbuild: packaging/aur/PKGBUILD
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to v${{ steps.version.outputs.version }}"
