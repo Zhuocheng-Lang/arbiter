@@ -3,16 +3,18 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{RwLock, mpsc};
+use tokio::sync::{RwLock, Semaphore, mpsc};
 
 use crate::applier::Applier;
 use crate::config::Config;
 use crate::platform::linux::{self, ProcEvent, start_event_stream};
 use crate::rules::{Matcher, ProcessContext, RuleSet};
 
+/// Maximum number of pending exec events buffered before new events are
+/// dropped under sustained burst load.
 const EXEC_QUEUE_CAPACITY: usize = 2048;
-const EXEC_WORKERS: usize = 32;
+/// Maximum number of exec events processed concurrently after dequeue.
+const EXEC_CONCURRENCY: usize = 32;
 
 // ── Daemon ────────────────────────────────────────────────────────────────────
 
@@ -44,54 +46,61 @@ impl Daemon {
         let (tx, mut rx) = mpsc::channel::<ProcEvent>(2048);
         start_event_stream(tx).await?;
 
-        // ── exec workers ──────────────────────────────────────────────────────
-        let (exec_tx, exec_rx) = mpsc::channel::<u32>(EXEC_QUEUE_CAPACITY);
-        let exec_rx = Arc::new(tokio::sync::Mutex::new(exec_rx));
-
-        for _ in 0..EXEC_WORKERS {
+        // ── exec queue + concurrency limiter ─────────────────────────────────
+        // Keep the old bounded-queue semantics so short bursts can be absorbed
+        // without dropping immediately, but replace the contended
+        // Arc<Mutex<Receiver>> worker pattern with a single dequeue task and a
+        // semaphore-limited spawn model.
+        let (exec_tx, mut exec_rx) = mpsc::channel::<u32>(EXEC_QUEUE_CAPACITY);
+        let sem = Arc::new(Semaphore::new(EXEC_CONCURRENCY));
+        {
             let m = Arc::clone(&matcher);
             let a = Arc::clone(&applier);
             let s = Arc::clone(&scheduler);
-            let exec_rx = Arc::clone(&exec_rx);
+            let sem = Arc::clone(&sem);
 
             tokio::spawn(async move {
-                loop {
-                    let pid = {
-                        let mut guard = exec_rx.lock().await;
-                        match guard.recv().await {
-                            Some(pid) => pid,
-                            None => break,
-                        }
+                while let Some(pid) = exec_rx.recv().await {
+                    let permit = match Arc::clone(&sem).acquire_owned().await {
+                        Ok(permit) => permit,
+                        Err(_) => break,
                     };
 
-                    // Give the process a moment to finish execve and populate
-                    // /proc/<pid>/comm, exe, cmdline.
-                    if delay_ms > 0 {
-                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                    }
+                    let m = Arc::clone(&m);
+                    let a = Arc::clone(&a);
+                    let s = Arc::clone(&s);
+                    tokio::spawn(async move {
+                        let _permit = permit;
 
-                    match ProcessContext::from_pid(pid) {
-                        Ok(ctx) => {
-                            let rule = {
-                                let guard = m.read().await;
-                                guard.find_match(&ctx).cloned()
-                            };
-                            if let Some(rule) = rule {
-                                if let Err(e) = a.apply(&ctx, &rule, &s) {
-                                    tracing::warn!(pid, "apply failed: {e}");
+                        // Give the process a moment to finish execve and
+                        // populate /proc/<pid>/{comm, exe, cmdline}.
+                        if delay_ms > 0 {
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                        }
+
+                        match ProcessContext::from_pid(pid) {
+                            Ok(ctx) => {
+                                let rule = {
+                                    let guard = m.read().await;
+                                    guard.find_match(&ctx).cloned()
+                                };
+                                if let Some(rule) = rule {
+                                    if let Err(e) = a.apply(&ctx, &rule, &s) {
+                                        tracing::warn!(pid, "apply failed: {e}");
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        pid,
+                                        comm = %ctx.comm,
+                                        "no rule matched"
+                                    );
                                 }
-                            } else {
-                                tracing::debug!(
-                                    pid,
-                                    comm = %ctx.comm,
-                                    "no rule matched"
-                                );
+                            }
+                            Err(e) => {
+                                tracing::trace!(pid, "proc read failed: {e}");
                             }
                         }
-                        Err(e) => {
-                            tracing::trace!(pid, "proc read failed: {e}");
-                        }
-                    }
+                    });
                 }
             });
         }
@@ -109,19 +118,12 @@ impl Daemon {
                 Some(event) = rx.recv() => {
                     match event {
                         ProcEvent::Exec { pid, .. } => {
-                            match exec_tx.try_send(pid) {
-                                Ok(()) => {}
-                                Err(TrySendError::Full(_)) => {
+                            if exec_tx.try_send(pid).is_err() {
                                     tracing::warn!(
                                         pid,
                                         capacity = EXEC_QUEUE_CAPACITY,
-                                        "exec worker queue full; dropping process event"
+                                        "exec queue full; dropping process event"
                                     );
-                                }
-                                Err(TrySendError::Closed(_)) => {
-                                    tracing::error!("exec worker queue closed unexpectedly");
-                                    break;
-                                }
                             }
                         }
 

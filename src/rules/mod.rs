@@ -100,6 +100,8 @@ pub struct Rule {
 #[derive(Debug, Clone)]
 pub struct ResolvedRule {
     pub name: String,
+    /// Pre-computed lowercase of `name`; avoids per-match allocation in hot path.
+    pub name_lowercase: String,
     pub nice: Option<i32>,
     pub ioclass: Option<IoClass>,
     pub ionice: Option<u8>,
@@ -514,6 +516,7 @@ impl RuleSet {
 
             let resolved_rule = ResolvedRule {
                 name: rule.name.clone(),
+                name_lowercase: rule.name.to_lowercase(),
                 nice: merge!(nice),
                 ioclass: merge!(ioclass),
                 ionice: merge!(ionice),

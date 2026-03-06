@@ -154,25 +154,60 @@ impl Applier {
     }
 
     fn set_oom_score_adj(&self, pid: u32, score: i32) -> Result<()> {
-        let path = format!("/proc/{pid}/oom_score_adj");
-        std::fs::write(&path, format!("{score}\n")).with_context(|| format!("write {path}"))?;
+        use std::io::{Cursor, Write as _};
+        // Stack-allocate the value string ("-1000\n" = 6 bytes max) to avoid
+        // a heap allocation per process event.
+        let path = CString::new(format!("/proc/{pid}/oom_score_adj"))
+            .expect("proc path is always valid ASCII");
+        let mut val_buf = [0u8; 8];
+        let val_len = {
+            let mut c = Cursor::new(&mut val_buf[..]);
+            write!(c, "{score}\n").expect("val_buf too small");
+            c.position() as usize
+        };
+        let flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        let fd = unsafe { libc::open(path.as_ptr(), flags) };
+        if fd < 0 {
+            bail!(
+                "open /proc/{pid}/oom_score_adj: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(&val_buf[..val_len])
+            .with_context(|| format!("write /proc/{pid}/oom_score_adj"))?;
         Ok(())
     }
 
     /// Move `pid` into the cgroup at `<cgroup_root>/<cgroup>` and optionally
     /// set `cpu.weight`. Creates the cgroup directory if missing.
     fn move_to_cgroup(&self, pid: u32, cgroup: &str, weight: Option<u64>) -> Result<()> {
+        use std::io::{Cursor, Write as _};
         let components = Self::validated_cgroup_components(cgroup)?;
         let cg_dir = self
             .open_cgroup_dir(&components)
             .with_context(|| format!("open cgroup dir for '{cgroup}'"))?;
 
-        self.write_control_file(&cg_dir, c"cgroup.procs", &format!("{pid}\n"))
+        // Stack-allocate pid and weight strings to avoid heap allocation per event.
+        let mut pid_buf = [0u8; 12]; // u32 max (4294967295) + '\n' = 11 bytes
+        let pid_len = {
+            let mut c = Cursor::new(&mut pid_buf[..]);
+            write!(c, "{pid}\n").expect("pid_buf too small");
+            c.position() as usize
+        };
+
+        self.write_control_file(&cg_dir, c"cgroup.procs", &pid_buf[..pid_len])
             .with_context(|| format!("write cgroup.procs for '{cgroup}'"))?;
 
         if let Some(w) = weight {
             let w = w.clamp(1, 10_000);
-            match self.write_control_file(&cg_dir, c"cpu.weight", &format!("{w}\n")) {
+            let mut wgt_buf = [0u8; 8]; // "10000\n" = 6 bytes
+            let wgt_len = {
+                let mut c = Cursor::new(&mut wgt_buf[..]);
+                write!(c, "{w}\n").expect("wgt_buf too small");
+                c.position() as usize
+            };
+            match self.write_control_file(&cg_dir, c"cpu.weight", &wgt_buf[..wgt_len]) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     tracing::debug!(cgroup, "cpu.weight missing, skipping weight write");
@@ -267,7 +302,7 @@ impl Applier {
         &self,
         dir_fd: &OwnedFd,
         name: &CStr,
-        contents: &str,
+        contents: &[u8],
     ) -> Result<(), std::io::Error> {
         let flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         let fd = unsafe { libc::openat(dir_fd.as_raw_fd(), name.as_ptr(), flags) };
@@ -276,7 +311,7 @@ impl Applier {
         }
 
         let mut file = unsafe { File::from_raw_fd(fd) };
-        file.write_all(contents.as_bytes())?;
+        file.write_all(contents)?;
         Ok(())
     }
 }

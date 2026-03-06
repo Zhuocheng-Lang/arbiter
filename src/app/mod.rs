@@ -72,7 +72,9 @@ fn run_explain(config: &Config, target: &str) -> Result<()> {
             ppid: 0,
             start_time_ticks: 0,
             comm: target.to_string(),
+            comm_lowercase: target.to_lowercase(),
             exe: None,
+            exe_name_lowercase: None,
             cmdline: None,
         }
     };
