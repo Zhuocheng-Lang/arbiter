@@ -8,6 +8,8 @@ use anyhow::Result;
 pub struct ProcessContext {
     pub pid: u32,
     pub ppid: u32,
+    /// Monotonic kernel start time from /proc/PID/stat, used to detect PID reuse.
+    pub start_time_ticks: u64,
     /// `comm` from /proc/PID/stat  (kernel-truncated to 15 chars).
     pub comm: String,
     /// Resolved exe path from /proc/PID/exe.
@@ -32,10 +34,26 @@ impl ProcessContext {
         Ok(ProcessContext {
             pid,
             ppid: stat.ppid as u32,
+            start_time_ticks: stat.starttime,
             comm: stat.comm,
             exe,
             cmdline,
         })
+    }
+
+    /// Best-effort PID reuse check before applying scheduler hints.
+    /// Returns `Ok(false)` when the process has already exited — that is the
+    /// normal TOCTOU race and must not propagate as an error.
+    pub fn matches_current_pid(&self) -> Result<bool> {
+        let proc = match procfs::process::Process::new(self.pid as i32) {
+            Ok(p) => p,
+            Err(_) => return Ok(false), // process exited between exec event and apply
+        };
+        let stat = match proc.stat() {
+            Ok(s) => s,
+            Err(_) => return Ok(false),
+        };
+        Ok(stat.starttime == self.start_time_ticks)
     }
 
     /// Basename of the exe path (useful when comm is truncated).

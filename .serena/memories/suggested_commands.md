@@ -1,0 +1,5 @@
+- `cargo test`：运行全部单元测试。
+- `cargo run -- check rules`：验证仓库内置规则目录。
+- `cargo run -- check`：验证默认配置路径下的规则目录。
+- `cargo run -- explain <name-or-pid>`：解释规则匹配结果。
+- `cargo run -- daemon --dry-run`：以 dry-run 模式启动守护进程。

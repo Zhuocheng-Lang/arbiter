@@ -1,0 +1,3 @@
+- 完成规则相关改动后，至少运行 `cargo test`。
+- 若修改了规则加载或诊断逻辑，再运行 `cargo run -- check rules` 验证仓库样例规则。
+- 若文档里涉及兼容性承诺，需同步核对 README.md 和 README_ZH_CN.md。

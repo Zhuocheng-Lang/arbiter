@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{RwLock, mpsc};
 
 use crate::applier::Applier;
@@ -11,6 +12,9 @@ use crate::matcher::{Matcher, ProcessContext};
 use crate::proc_events::{ProcEvent, start_event_stream};
 use crate::rules::RuleSet;
 use crate::scx;
+
+const EXEC_QUEUE_CAPACITY: usize = 2048;
+const EXEC_WORKERS: usize = 32;
 
 // ── Daemon ────────────────────────────────────────────────────────────────────
 
@@ -26,7 +30,7 @@ impl Daemon {
     pub async fn run(self) -> Result<()> {
         // ── load rules ────────────────────────────────────────────────────────
         let ruleset = RuleSet::load_from_dirs(&self.config.rules_dirs)?;
-        let resolved = ruleset.resolved_rules();
+        let resolved = ruleset.validate()?;
         tracing::info!(count = resolved.len(), "Rules loaded");
 
         // ── build shared components ───────────────────────────────────────────
@@ -42,6 +46,58 @@ impl Daemon {
         let (tx, mut rx) = mpsc::channel::<ProcEvent>(2048);
         start_event_stream(tx).await?;
 
+        // ── exec workers ──────────────────────────────────────────────────────
+        let (exec_tx, exec_rx) = mpsc::channel::<u32>(EXEC_QUEUE_CAPACITY);
+        let exec_rx = Arc::new(tokio::sync::Mutex::new(exec_rx));
+
+        for _ in 0..EXEC_WORKERS {
+            let m = Arc::clone(&matcher);
+            let a = Arc::clone(&applier);
+            let s = Arc::clone(&scheduler);
+            let exec_rx = Arc::clone(&exec_rx);
+
+            tokio::spawn(async move {
+                loop {
+                    let pid = {
+                        let mut guard = exec_rx.lock().await;
+                        match guard.recv().await {
+                            Some(pid) => pid,
+                            None => break,
+                        }
+                    };
+
+                    // Give the process a moment to finish execve and populate
+                    // /proc/<pid>/comm, exe, cmdline.
+                    if delay_ms > 0 {
+                        tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    }
+
+                    match ProcessContext::from_pid(pid) {
+                        Ok(ctx) => {
+                            let rule = {
+                                let guard = m.read().await;
+                                guard.find_match(&ctx).cloned()
+                            };
+                            if let Some(rule) = rule {
+                                if let Err(e) = a.apply(&ctx, &rule, &s) {
+                                    tracing::warn!(pid, "apply failed: {e}");
+                                }
+                            } else {
+                                tracing::debug!(
+                                    pid,
+                                    comm = %ctx.comm,
+                                    "no rule matched"
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            tracing::trace!(pid, "proc read failed: {e}");
+                        }
+                    }
+                }
+            });
+        }
+
         // ── signal handlers ───────────────────────────────────────────────────
         let mut sig_term = signal(SignalKind::terminate())?;
         let mut sig_int = signal(SignalKind::interrupt())?;
@@ -55,42 +111,20 @@ impl Daemon {
                 Some(event) = rx.recv() => {
                     match event {
                         ProcEvent::Exec { pid, .. } => {
-                            let m = Arc::clone(&matcher);
-                            let a = Arc::clone(&applier);
-                            let s = Arc::clone(&scheduler);
-
-                            tokio::spawn(async move {
-                                // Give the process a moment to finish execve
-                                // and populate /proc/<pid>/comm, exe, cmdline.
-                                if delay_ms > 0 {
-                                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            match exec_tx.try_send(pid) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    tracing::warn!(
+                                        pid,
+                                        capacity = EXEC_QUEUE_CAPACITY,
+                                        "exec worker queue full; dropping process event"
+                                    );
                                 }
-
-                                match ProcessContext::from_pid(pid) {
-                                    Ok(ctx) => {
-                                        // Clone the matched rule before releasing the read lock.
-                                        let rule = {
-                                            let guard = m.read().await;
-                                            guard.find_match(&ctx).cloned()
-                                        };
-                                        if let Some(rule) = rule {
-                                            if let Err(e) = a.apply(&ctx, &rule, &s) {
-                                                tracing::warn!(pid, "apply failed: {e}");
-                                            }
-                                        } else {
-                                            tracing::debug!(
-                                                pid,
-                                                comm = %ctx.comm,
-                                                "no rule matched"
-                                            );
-                                        }
-                                    }
-                                    Err(e) => {
-                                        // Process may have already exited — normal.
-                                        tracing::trace!(pid, "proc read failed: {e}");
-                                    }
+                                Err(TrySendError::Closed(_)) => {
+                                    tracing::error!("exec worker queue closed unexpectedly");
+                                    break;
                                 }
-                            });
+                            }
                         }
 
                         ProcEvent::Fork { child_pid, .. } => {
@@ -107,7 +141,13 @@ impl Daemon {
                     tracing::info!("SIGHUP received — reloading rules");
                     match RuleSet::load_from_dirs(&rules_dirs) {
                         Ok(rs) => {
-                            let resolved = rs.resolved_rules();
+                            let resolved = match rs.validate() {
+                                Ok(resolved) => resolved,
+                                Err(e) => {
+                                    tracing::error!("Rule reload validation failed, keeping existing rules: {e}");
+                                    continue;
+                                }
+                            };
                             let count = resolved.len();
                             *matcher.write().await = Matcher::new(resolved);
                             tracing::info!(count, "Rules reloaded");
@@ -127,6 +167,8 @@ impl Daemon {
                 }
             }
         }
+
+        drop(exec_tx);
 
         Ok(())
     }

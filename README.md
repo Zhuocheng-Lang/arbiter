@@ -27,7 +27,7 @@ Arbiter does **not** replace your scx scheduler. It adjusts the process attribut
 
 ## Features
 
-- **Ananicy-cpp rule compatibility** — Drop in your existing `.rules`, `.types`, and `.cgroups` files
+- **Ananicy-cpp rule compatibility** — Drop in your existing `.rules` and `.types` files; `.cgroups` files are currently reported and ignored
 - **Event-driven process detection** — Near-instant response to new processes via netlink connector
 - **scx-aware behavior** — Detects the active scheduler and adapts strategy accordingly
 - **`nice` / `ionice` / `oom_score_adj`** — Full support for all standard priority axes

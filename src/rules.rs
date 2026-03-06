@@ -1,9 +1,35 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use glob::glob;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::fmt;
+use std::path::{Component, Path, PathBuf};
+
+const TYPEDEF_FIELDS: &[&str] = &[
+    "type",
+    "nice",
+    "ioclass",
+    "ionice",
+    "oom_score_adj",
+    "cgroup",
+    "cgroup_weight",
+    "sched",
+];
+
+const RULE_FIELDS: &[&str] = &[
+    "name",
+    "type",
+    "nice",
+    "ioclass",
+    "ionice",
+    "oom_score_adj",
+    "cgroup",
+    "cgroup_weight",
+    "exe_pattern",
+    "cmdline_contains",
+];
 
 // ── IoClass ───────────────────────────────────────────────────────────────────
 
@@ -98,12 +124,128 @@ impl ResolvedRule {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiagnosticSeverity {
+    Warning,
+    Error,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourceLocation {
+    path: PathBuf,
+    line: usize,
+}
+
+impl SourceLocation {
+    fn new(path: &Path, line: usize) -> Self {
+        Self {
+            path: path.to_path_buf(),
+            line,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuleDiagnostic {
+    severity: DiagnosticSeverity,
+    source: SourceLocation,
+    entry_name: Option<String>,
+    message: String,
+}
+
+impl RuleDiagnostic {
+    fn warning(source: &SourceLocation, entry_name: Option<String>, message: impl Into<String>) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Warning,
+            source: source.clone(),
+            entry_name,
+            message: message.into(),
+        }
+    }
+
+    fn error(source: &SourceLocation, entry_name: Option<String>, message: impl Into<String>) -> Self {
+        Self {
+            severity: DiagnosticSeverity::Error,
+            source: source.clone(),
+            entry_name,
+            message: message.into(),
+        }
+    }
+
+    fn is_error(&self) -> bool {
+        self.severity == DiagnosticSeverity::Error
+    }
+
+    fn is_warning(&self) -> bool {
+        self.severity == DiagnosticSeverity::Warning
+    }
+}
+
+impl fmt::Display for RuleDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let severity = match self.severity {
+            DiagnosticSeverity::Warning => "warning",
+            DiagnosticSeverity::Error => "error",
+        };
+
+        write!(f, "{severity}: {}", self.source.path.display())?;
+        if self.source.line > 0 {
+            write!(f, ":{}", self.source.line)?;
+        }
+        if let Some(entry_name) = &self.entry_name {
+            write!(f, ": entry '{}'", entry_name)?;
+        }
+        write!(f, ": {}", self.message)
+    }
+}
+
+#[derive(Debug)]
+struct RuleLoadReport {
+    ruleset: RuleSet,
+    diagnostics: Vec<RuleDiagnostic>,
+}
+
+impl RuleLoadReport {
+    fn emit_warnings(&self) {
+        emit_warning_logs(&self.diagnostics);
+    }
+
+    fn into_result(self) -> Result<RuleSet> {
+        into_result("loading", self.diagnostics, self.ruleset)
+    }
+}
+
+#[derive(Debug)]
+struct RuleValidationReport {
+    resolved: Vec<ResolvedRule>,
+    diagnostics: Vec<RuleDiagnostic>,
+}
+
+impl RuleValidationReport {
+    fn emit_warnings(&self) {
+        emit_warning_logs(&self.diagnostics);
+    }
+
+    fn into_result(self) -> Result<Vec<ResolvedRule>> {
+        into_result("validation", self.diagnostics, self.resolved)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RuleSelectorKey {
+    name: String,
+    exe_pattern: Option<String>,
+    cmdline_contains: Option<String>,
+}
+
 // ── RuleSet ───────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]
 pub struct RuleSet {
     pub types: HashMap<String, TypeDef>,
     pub rules: Vec<Rule>,
+    type_sources: HashMap<String, SourceLocation>,
+    rule_sources: Vec<SourceLocation>,
 }
 
 impl RuleSet {
@@ -113,13 +255,9 @@ impl RuleSet {
 
     /// Load all *.types then *.rules from each directory in `dirs`.
     pub fn load_from_dirs(dirs: &[PathBuf]) -> Result<Self> {
-        let mut rs = Self::new();
-        for dir in dirs {
-            if dir.exists() {
-                rs.load_dir(dir)
-                    .with_context(|| format!("Failed to load rules from {}", dir.display()))?;
-            }
-        }
+        let report = Self::load_report_from_dirs(dirs)?;
+        report.emit_warnings();
+        let rs = report.into_result()?;
         tracing::info!(
             types = rs.types.len(),
             rules = rs.rules.len(),
@@ -128,130 +266,662 @@ impl RuleSet {
         Ok(rs)
     }
 
-    fn load_dir(&mut self, dir: &Path) -> Result<()> {
+    fn load_report_from_dirs(dirs: &[PathBuf]) -> Result<RuleLoadReport> {
+        let mut rs = Self::new();
+        let mut diagnostics = Vec::new();
+        for dir in dirs {
+            if dir.exists() {
+                rs.load_dir_with_diagnostics(dir, &mut diagnostics)
+                    .with_context(|| format!("Failed to load rules from {}", dir.display()))?;
+            }
+        }
+        Ok(RuleLoadReport {
+            ruleset: rs,
+            diagnostics,
+        })
+    }
+
+    fn load_dir_with_diagnostics(
+        &mut self,
+        dir: &Path,
+        diagnostics: &mut Vec<RuleDiagnostic>,
+    ) -> Result<()> {
         let types_glob = dir.join("*.types").to_string_lossy().into_owned();
         let rules_glob = dir.join("*.rules").to_string_lossy().into_owned();
+        let cgroups_glob = dir.join("*.cgroups").to_string_lossy().into_owned();
 
-        for entry in glob(&types_glob).context("glob *.types")?.flatten() {
-            self.load_types_file(&entry)
+        for entry in sorted_glob(&types_glob).context("glob *.types")? {
+            self.load_types_file_with_diagnostics(&entry, diagnostics)
                 .with_context(|| format!("types file: {}", entry.display()))?;
         }
-        for entry in glob(&rules_glob).context("glob *.rules")?.flatten() {
-            self.load_rules_file(&entry)
+        for entry in sorted_glob(&rules_glob).context("glob *.rules")? {
+            self.load_rules_file_with_diagnostics(&entry, diagnostics)
                 .with_context(|| format!("rules file: {}", entry.display()))?;
         }
+        for entry in sorted_glob(&cgroups_glob).context("glob *.cgroups")? {
+            diagnostics.push(RuleDiagnostic::warning(
+                &SourceLocation::new(&entry, 0),
+                None,
+                "'.cgroups' files are currently ignored; convert their settings into '.types' or '.rules' entries",
+            ));
+        }
         Ok(())
     }
 
-    fn load_types_file(&mut self, path: &Path) -> Result<()> {
+    fn load_types_file_with_diagnostics(
+        &mut self,
+        path: &Path,
+        diagnostics: &mut Vec<RuleDiagnostic>,
+    ) -> Result<()> {
         let content = std::fs::read_to_string(path)?;
         for (lineno, raw) in content.lines().enumerate() {
             let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            match serde_json::from_str::<TypeDef>(line) {
-                Ok(t) => {
-                    self.types.insert(t.name.clone(), t);
-                }
-                Err(e) => tracing::warn!(
-                    file = %path.display(), line = lineno + 1,
-                    "Skipping malformed type: {}", e
-                ),
-            }
-        }
-        Ok(())
-    }
 
-    fn load_rules_file(&mut self, path: &Path) -> Result<()> {
-        let content = std::fs::read_to_string(path)?;
-        for (lineno, raw) in content.lines().enumerate() {
-            let line = raw.trim();
-            if line.is_empty() || line.starts_with('#') {
+            let source = SourceLocation::new(path, lineno + 1);
+            let Some(value) = parse_json_object(line, &source, diagnostics) else {
                 continue;
-            }
-            match serde_json::from_str::<Rule>(line) {
-                Ok(r) => self.rules.push(r),
-                Err(e) => tracing::warn!(
-                    file = %path.display(), line = lineno + 1,
-                    "Skipping malformed rule: {}", e
-                ),
-            }
-        }
-        Ok(())
-    }
-
-    /// Merge type defaults into a rule and compile regex patterns.
-    pub fn resolve(&self, rule: &Rule) -> Result<ResolvedRule> {
-        let type_def = rule.type_name.as_deref().and_then(|t| {
-            let td = self.types.get(t);
-            if td.is_none() {
-                tracing::warn!(rule = %rule.name, r#type = t, "Referenced type not found");
-            }
-            td
-        });
-
-        // Rule fields override type defaults.
-        macro_rules! merge {
-            ($field:ident) => {
-                rule.$field.or_else(|| type_def.and_then(|t| t.$field))
             };
+
+            push_unknown_field_warning(&source, None, &value, TYPEDEF_FIELDS, diagnostics);
+
+            let type_def: TypeDef = match serde_json::from_value(value) {
+                Ok(type_def) => type_def,
+                Err(err) => {
+                    diagnostics.push(RuleDiagnostic::warning(
+                        &source,
+                        None,
+                        format!("skipping invalid type entry: {err}"),
+                    ));
+                    continue;
+                }
+            };
+
+            if type_def.name.trim().is_empty() {
+                diagnostics.push(RuleDiagnostic::warning(
+                    &source,
+                    None,
+                    "skipping type entry with missing or empty 'type' name",
+                ));
+                continue;
+            }
+
+            if type_def.sched.is_some() {
+                diagnostics.push(RuleDiagnostic::warning(
+                    &source,
+                    Some(type_def.name.clone()),
+                    "field 'sched' is reserved for compatibility and is ignored",
+                ));
+            }
+
+            if let Some(previous) = self.type_sources.get(&type_def.name) {
+                diagnostics.push(RuleDiagnostic::warning(
+                    &source,
+                    Some(type_def.name.clone()),
+                    format!(
+                        "duplicate type overrides earlier definition at {}:{}",
+                        previous.path.display(),
+                        previous.line
+                    ),
+                ));
+            }
+
+            self.type_sources.insert(type_def.name.clone(), source);
+            self.types.insert(type_def.name.clone(), type_def);
         }
+        Ok(())
+    }
 
-        let exe_pattern = match &rule.exe_pattern {
-            Some(p) => Some(Regex::new(p).with_context(|| {
-                format!("Invalid exe_pattern regex in rule '{}': {p}", rule.name)
-            })?),
-            None => None,
-        };
+    fn load_rules_file_with_diagnostics(
+        &mut self,
+        path: &Path,
+        diagnostics: &mut Vec<RuleDiagnostic>,
+    ) -> Result<()> {
+        let content = std::fs::read_to_string(path)?;
+        for (lineno, raw) in content.lines().enumerate() {
+            let line = raw.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
 
-        Ok(ResolvedRule {
-            name: rule.name.clone(),
-            nice: merge!(nice),
-            ioclass: merge!(ioclass),
-            ionice: merge!(ionice),
-            oom_score_adj: merge!(oom_score_adj),
-            cgroup: rule
-                .cgroup
-                .clone()
-                .or_else(|| type_def.and_then(|t| t.cgroup.clone())),
-            cgroup_weight: merge!(cgroup_weight),
-            exe_pattern,
-            cmdline_contains: rule.cmdline_contains.clone(),
-        })
+            let source = SourceLocation::new(path, lineno + 1);
+            let Some(value) = parse_json_object(line, &source, diagnostics) else {
+                continue;
+            };
+
+            push_unknown_field_warning(&source, None, &value, RULE_FIELDS, diagnostics);
+
+            let rule: Rule = match serde_json::from_value(value) {
+                Ok(rule) => rule,
+                Err(err) => {
+                    diagnostics.push(RuleDiagnostic::warning(
+                        &source,
+                        None,
+                        format!("skipping invalid rule entry: {err}"),
+                    ));
+                    continue;
+                }
+            };
+
+            if rule.name.trim().is_empty() {
+                diagnostics.push(RuleDiagnostic::warning(
+                    &source,
+                    None,
+                    "skipping rule entry with missing or empty 'name'",
+                ));
+                continue;
+            }
+
+            self.rule_sources.push(source);
+            self.rules.push(rule);
+        }
+        Ok(())
     }
 
     /// Resolve all rules, logging and skipping any that fail.
     pub fn resolved_rules(&self) -> Vec<ResolvedRule> {
-        self.rules
-            .iter()
-            .filter_map(|r| {
-                self.resolve(r)
-                    .map_err(|e| tracing::warn!("Cannot resolve rule '{}': {}", r.name, e))
-                    .ok()
-            })
-            .collect()
+        let report = self.validation_report();
+        report.emit_warnings();
+        for diagnostic in report.diagnostics.iter().filter(|diagnostic| diagnostic.is_error()) {
+            tracing::error!("Skipping invalid rule: {diagnostic}");
+        }
+        report.resolved
     }
 
     /// Resolve all rules strictly — returns `Err` listing every failure.
     /// Used by the `check` command to surface misconfiguration.
     pub fn validate(&self) -> Result<Vec<ResolvedRule>> {
+        let report = self.validation_report();
+        report.emit_warnings();
+        report.into_result()
+    }
+
+    fn validation_report(&self) -> RuleValidationReport {
         let mut resolved = Vec::with_capacity(self.rules.len());
-        let mut errors: Vec<String> = Vec::new();
-        for rule in &self.rules {
-            match self.resolve(rule) {
-                Ok(r) => resolved.push(r),
-                Err(e) => errors.push(format!("  rule '{}': {e}", rule.name)),
+        let mut diagnostics = Vec::new();
+        let mut seen_selectors: HashMap<RuleSelectorKey, SourceLocation> = HashMap::new();
+
+        for (index, rule) in self.rules.iter().enumerate() {
+            let source = self
+                .rule_sources
+                .get(index)
+                .cloned()
+                .unwrap_or_else(|| SourceLocation::new(Path::new("<unknown>"), 0));
+
+            let selector_key = RuleSelectorKey {
+                name: rule.name.clone(),
+                exe_pattern: rule.exe_pattern.clone(),
+                cmdline_contains: rule.cmdline_contains.clone(),
+            };
+            if let Some(previous) = seen_selectors.get(&selector_key) {
+                diagnostics.push(RuleDiagnostic::warning(
+                    &source,
+                    Some(rule.name.clone()),
+                    format!(
+                        "selector duplicates earlier rule at {}:{}; first-match-wins means this rule is shadowed",
+                        previous.path.display(),
+                        previous.line
+                    ),
+                ));
+            } else {
+                seen_selectors.insert(selector_key, source.clone());
+            }
+
+            let type_def = match rule.type_name.as_deref() {
+                Some(type_name) => match self.types.get(type_name) {
+                    Some(type_def) => Some(type_def),
+                    None => {
+                        diagnostics.push(RuleDiagnostic::error(
+                            &source,
+                            Some(rule.name.clone()),
+                            format!("referenced type '{type_name}' was not loaded"),
+                        ));
+                        continue;
+                    }
+                },
+                None => None,
+            };
+
+            macro_rules! merge {
+                ($field:ident) => {
+                    rule.$field.or_else(|| type_def.and_then(|type_def| type_def.$field))
+                };
+            }
+
+            let exe_pattern = match &rule.exe_pattern {
+                Some(pattern) => match Regex::new(pattern) {
+                    Ok(regex) => Some(regex),
+                    Err(err) => {
+                        diagnostics.push(RuleDiagnostic::error(
+                            &source,
+                            Some(rule.name.clone()),
+                            format!("invalid exe_pattern regex '{pattern}': {err}"),
+                        ));
+                        continue;
+                    }
+                },
+                None => None,
+            };
+
+            let resolved_rule = ResolvedRule {
+                name: rule.name.clone(),
+                nice: merge!(nice),
+                ioclass: merge!(ioclass),
+                ionice: merge!(ionice),
+                oom_score_adj: merge!(oom_score_adj),
+                cgroup: rule
+                    .cgroup
+                    .clone()
+                    .or_else(|| type_def.and_then(|type_def| type_def.cgroup.clone())),
+                cgroup_weight: merge!(cgroup_weight),
+                exe_pattern,
+                cmdline_contains: rule.cmdline_contains.clone(),
+            };
+
+            let prev_diag_len = diagnostics.len();
+            validate_resolved_rule(&source, rule, &resolved_rule, &mut diagnostics);
+            let has_new_errors = diagnostics[prev_diag_len..].iter().any(|d| d.is_error());
+            if !has_new_errors {
+                resolved.push(resolved_rule);
             }
         }
-        if errors.is_empty() {
-            Ok(resolved)
-        } else {
-            anyhow::bail!(
-                "{} rule(s) failed to resolve:\n{}",
-                errors.len(),
-                errors.join("\n")
-            )
+
+        RuleValidationReport {
+            resolved,
+            diagnostics,
         }
+    }
+}
+
+fn sorted_glob(pattern: &str) -> Result<Vec<PathBuf>> {
+    let mut entries = Vec::new();
+    for entry in glob(pattern)? {
+        entries.push(entry.with_context(|| format!("glob entry for pattern '{pattern}'"))?);
+    }
+    entries.sort();
+    Ok(entries)
+}
+
+/// Two-step parse: first validates JSON structure, then deserialises into the typed struct.
+/// Structural failures produce *warnings* (not errors) so that a single malformed line in
+/// a community rule file does not prevent the daemon from starting — only `validate()` is strict.
+fn parse_json_object(
+    line: &str,
+    source: &SourceLocation,
+    diagnostics: &mut Vec<RuleDiagnostic>,
+) -> Option<Value> {
+    let value: Value = match serde_json::from_str(line) {
+        Ok(value) => value,
+        Err(err) => {
+            diagnostics.push(RuleDiagnostic::warning(
+                source,
+                None,
+                format!("skipping malformed JSON entry: {err}"),
+            ));
+            return None;
+        }
+    };
+
+    if !value.is_object() {
+        diagnostics.push(RuleDiagnostic::warning(
+            source,
+            None,
+            "skipping entry: expected a JSON object",
+        ));
+        return None;
+    }
+
+    Some(value)
+}
+
+fn push_unknown_field_warning(
+    source: &SourceLocation,
+    entry_name: Option<String>,
+    value: &Value,
+    allowed_fields: &[&str],
+    diagnostics: &mut Vec<RuleDiagnostic>,
+) {
+    // Linear scan over a short fixed-size slice is faster than a HashSet for < 15 fields.
+    let mut unknown_fields = value
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.keys())
+        .filter(|key| !allowed_fields.contains(&key.as_str()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if unknown_fields.is_empty() {
+        return;
+    }
+
+    unknown_fields.sort();
+    diagnostics.push(RuleDiagnostic::warning(
+        source,
+        entry_name,
+        format!("unknown fields ignored: {}", unknown_fields.join(", ")),
+    ));
+}
+
+fn validate_resolved_rule(
+    source: &SourceLocation,
+    rule: &Rule,
+    resolved_rule: &ResolvedRule,
+    diagnostics: &mut Vec<RuleDiagnostic>,
+) {
+    if let Some(nice) = resolved_rule.nice {
+        if !(-20..=19).contains(&nice) {
+            diagnostics.push(RuleDiagnostic::warning(
+                source,
+                Some(rule.name.clone()),
+                format!("nice value {nice} is outside [-20, 19] and will be clamped during apply"),
+            ));
+        }
+    }
+
+    if let Some(ionice) = resolved_rule.ionice {
+        if resolved_rule.ioclass.is_none() {
+            diagnostics.push(RuleDiagnostic::warning(
+                source,
+                Some(rule.name.clone()),
+                "ionice is set but ioclass is missing; ionice will be ignored during apply",
+            ));
+        }
+        if ionice > 7 {
+            diagnostics.push(RuleDiagnostic::warning(
+                source,
+                Some(rule.name.clone()),
+                format!("ionice level {ionice} is outside [0, 7] and will be clamped during apply"),
+            ));
+        }
+    }
+
+    if let Some(oom_score_adj) = resolved_rule.oom_score_adj {
+        if !(-1000..=1000).contains(&oom_score_adj) {
+            diagnostics.push(RuleDiagnostic::warning(
+                source,
+                Some(rule.name.clone()),
+                format!(
+                    "oom_score_adj value {oom_score_adj} is outside [-1000, 1000] and will be clamped during apply"
+                ),
+            ));
+        }
+    }
+
+    if let Some(cgroup_weight) = resolved_rule.cgroup_weight {
+        if resolved_rule.cgroup.is_none() {
+            diagnostics.push(RuleDiagnostic::warning(
+                source,
+                Some(rule.name.clone()),
+                "cgroup_weight is set without cgroup; it has no effect",
+            ));
+        }
+        if !(1..=10_000).contains(&cgroup_weight) {
+            diagnostics.push(RuleDiagnostic::warning(
+                source,
+                Some(rule.name.clone()),
+                format!(
+                    "cgroup_weight value {cgroup_weight} is outside [1, 10000] and will be clamped during apply"
+                ),
+            ));
+        }
+    }
+
+    if let Some(cgroup) = &resolved_rule.cgroup {
+        if let Err(err) = validate_cgroup_path(cgroup) {
+            diagnostics.push(RuleDiagnostic::error(
+                source,
+                Some(rule.name.clone()),
+                format!("invalid cgroup path '{cgroup}': {err}"),
+            ));
+        }
+    }
+
+    if !resolved_rule.has_effects() {
+        diagnostics.push(RuleDiagnostic::warning(
+            source,
+            Some(rule.name.clone()),
+            "rule matches processes but does not change any supported setting",
+        ));
+    }
+}
+
+fn validate_cgroup_path(cgroup: &str) -> Result<()> {
+    if cgroup.is_empty() {
+        bail!("path is empty");
+    }
+    if cgroup.starts_with('/') {
+        bail!("absolute paths are not allowed");
+    }
+
+    let mut saw_component = false;
+    for component in Path::new(cgroup).components() {
+        match component {
+            Component::Normal(part) => {
+                if part.is_empty() {
+                    bail!("path contains an empty component");
+                }
+                saw_component = true;
+            }
+            Component::CurDir | Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("path must not contain '.', '..', or a root prefix");
+            }
+        }
+    }
+
+    if !saw_component {
+        bail!("path is empty");
+    }
+
+    Ok(())
+}
+
+fn emit_warning_logs(diagnostics: &[RuleDiagnostic]) {
+    for diagnostic in diagnostics.iter().filter(|diagnostic| diagnostic.is_warning()) {
+        tracing::warn!("{diagnostic}");
+    }
+}
+
+fn into_result<T>(stage: &str, diagnostics: Vec<RuleDiagnostic>, value: T) -> Result<T> {
+    let errors = diagnostics
+        .into_iter()
+        .filter(|diagnostic| diagnostic.is_error())
+        .map(|diagnostic| format!("  {diagnostic}"))
+        .collect::<Vec<_>>();
+
+    if errors.is_empty() {
+        Ok(value)
+    } else {
+        bail!(
+            "{} problem(s) found during rule {stage}:\n{}",
+            errors.len(),
+            errors.join("\n")
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Rule, RuleSet, SourceLocation, TypeDef};
+    use std::path::Path;
+
+    fn source(line: usize) -> SourceLocation {
+        SourceLocation::new(Path::new("rules/test.rules"), line)
+    }
+
+    #[test]
+    fn missing_type_is_a_validation_error() {
+        let mut ruleset = RuleSet::new();
+        ruleset.rules.push(Rule {
+            name: "steam".into(),
+            type_name: Some("Game".into()),
+            nice: None,
+            ioclass: None,
+            ionice: None,
+            oom_score_adj: None,
+            cgroup: None,
+            cgroup_weight: None,
+            exe_pattern: None,
+            cmdline_contains: None,
+        });
+        ruleset.rule_sources.push(source(3));
+
+        let report = ruleset.validation_report();
+
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic.is_error()));
+        assert!(report.resolved.is_empty());
+    }
+
+    #[test]
+    fn duplicate_selectors_are_warned_and_rule_still_resolves() {
+        let mut ruleset = RuleSet::new();
+        ruleset.types.insert(
+            "Game".into(),
+            TypeDef {
+                name: "Game".into(),
+                nice: Some(-5),
+                ioclass: None,
+                ionice: None,
+                oom_score_adj: None,
+                cgroup: None,
+                cgroup_weight: None,
+                sched: None,
+            },
+        );
+
+        for line in [4, 5] {
+            ruleset.rules.push(Rule {
+                name: "steam".into(),
+                type_name: Some("Game".into()),
+                nice: None,
+                ioclass: None,
+                ionice: None,
+                oom_score_adj: None,
+                cgroup: None,
+                cgroup_weight: None,
+                exe_pattern: None,
+                cmdline_contains: None,
+            });
+            ruleset.rule_sources.push(source(line));
+        }
+
+        let report = ruleset.validation_report();
+
+        assert_eq!(report.resolved.len(), 2);
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic.is_warning()));
+    }
+
+    #[test]
+    fn unsafe_cgroup_path_is_rejected_during_validation() {
+        let mut ruleset = RuleSet::new();
+        ruleset.rules.push(Rule {
+            name: "bad".into(),
+            type_name: None,
+            nice: Some(0),
+            ioclass: None,
+            ionice: None,
+            oom_score_adj: None,
+            cgroup: Some("../escape".into()),
+            cgroup_weight: None,
+            exe_pattern: None,
+            cmdline_contains: None,
+        });
+        ruleset.rule_sources.push(source(7));
+
+        let report = ruleset.validation_report();
+
+        assert!(report.diagnostics.iter().any(|diagnostic| diagnostic.is_error()));
+        assert!(report.resolved.is_empty());
+    }
+
+    #[test]
+    fn no_effects_rule_produces_warning() {
+        let mut ruleset = RuleSet::new();
+        ruleset.rules.push(Rule {
+            name: "mystery".into(),
+            type_name: None,
+            nice: None,
+            ioclass: None,
+            ionice: None,
+            oom_score_adj: None,
+            cgroup: None,
+            cgroup_weight: None,
+            exe_pattern: None,
+            cmdline_contains: None,
+        });
+        ruleset.rule_sources.push(source(1));
+
+        let report = ruleset.validation_report();
+
+        assert_eq!(report.resolved.len(), 1, "no-effects rule should still resolve");
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| d.is_warning())
+                .any(|d| d.message.contains("does not change")),
+            "expected a no-effects warning"
+        );
+    }
+
+    #[test]
+    fn ionice_without_ioclass_produces_warning() {
+        let mut ruleset = RuleSet::new();
+        ruleset.rules.push(Rule {
+            name: "proc".into(),
+            type_name: None,
+            nice: Some(0),
+            ioclass: None,
+            ionice: Some(4),
+            oom_score_adj: None,
+            cgroup: None,
+            cgroup_weight: None,
+            exe_pattern: None,
+            cmdline_contains: None,
+        });
+        ruleset.rule_sources.push(source(1));
+
+        let report = ruleset.validation_report();
+
+        assert_eq!(report.resolved.len(), 1);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| d.is_warning())
+                .any(|d| d.message.contains("ioclass")),
+            "expected an ioclass-missing warning"
+        );
+    }
+
+    #[test]
+    fn cgroup_weight_without_cgroup_produces_warning() {
+        let mut ruleset = RuleSet::new();
+        ruleset.rules.push(Rule {
+            name: "proc".into(),
+            type_name: None,
+            nice: Some(5),
+            ioclass: None,
+            ionice: None,
+            oom_score_adj: None,
+            cgroup: None,
+            cgroup_weight: Some(800),
+            exe_pattern: None,
+            cmdline_contains: None,
+        });
+        ruleset.rule_sources.push(source(1));
+
+        let report = ruleset.validation_report();
+
+        assert_eq!(report.resolved.len(), 1);
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .filter(|d| d.is_warning())
+                .any(|d| d.message.contains("cgroup_weight")),
+            "expected a cgroup_weight-without-cgroup warning"
+        );
     }
 }

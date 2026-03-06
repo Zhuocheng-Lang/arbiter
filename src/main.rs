@@ -60,7 +60,7 @@ async fn main() -> Result<()> {
         // ── explain ───────────────────────────────────────────────────────────
         Commands::Explain { target } => {
             let ruleset = RuleSet::load_from_dirs(&config.rules_dirs)?;
-            let resolved = ruleset.resolved_rules();
+            let resolved = ruleset.validate()?;
             let matcher = arbiter::matcher::Matcher::new(resolved);
 
             let ctx = if let Ok(pid) = target.parse::<u32>() {
@@ -70,6 +70,7 @@ async fn main() -> Result<()> {
                 ProcessContext {
                     pid: 0,
                     ppid: 0,
+                    start_time_ticks: 0,
                     comm: target.clone(),
                     exe: None,
                     cmdline: None,
@@ -105,12 +106,17 @@ async fn main() -> Result<()> {
         Commands::Status => {
             let scheduler = scx::detect();
             let ruleset = RuleSet::load_from_dirs(&config.rules_dirs)?;
+            let resolved = ruleset.validate()?;
 
             println!("Scheduler : {scheduler}");
             println!("Strategy  : {:?}", scheduler.strategy());
             println!("Profile   : {}", config.profile);
             println!("Types     : {}", ruleset.types.len());
-            println!("Rules     : {}", ruleset.rules.len());
+            println!(
+                "Rules     : {} loaded, {} resolved",
+                ruleset.rules.len(),
+                resolved.len()
+            );
             println!("Dry-run   : {}", config.dry_run);
         }
 
