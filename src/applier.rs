@@ -56,11 +56,15 @@ impl Applier {
         }
 
         if !ctx.matches_current_pid()? {
-            bail!(
-                "PID {} no longer refers to the matched process; refusing to apply stale rule '{}'",
-                ctx.pid,
-                rule.name
+            // The process exited (or re-exec'd under a new identity) between the exec event
+            // and now.  This is the normal TOCTOU race inherent in netlink-based monitoring;
+            // it is not an error worth warning about.
+            tracing::debug!(
+                pid  = ctx.pid,
+                rule = %rule.name,
+                "process exited before rule could be applied (expected TOCTOU race)"
             );
+            return Ok(result);
         }
 
         let strategy = scheduler.strategy();

@@ -340,6 +340,9 @@ fn recv_subscribe_ack(fd: c_int) -> Result<()> {
             }
             bail!("recv(subscribe-ack): {err}");
         }
+        if n == 0 {
+            bail!("recv(subscribe-ack): kernel closed the netlink socket unexpectedly");
+        }
 
         for message in parse_messages(&buf[..n as usize]) {
             match message {
