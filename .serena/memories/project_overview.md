@@ -1,4 +1,0 @@
-- Arbiter 是 Rust 编写的 Linux 进程优先级管理守护进程，面向 sched_ext/scx 场景。
-- 关键入口：daemon 监听 PROC_EVENT_EXEC，rules 负责规则加载与校验，matcher 负责匹配，applier 负责应用。
-- 规则格式以 ananicy-cpp 风格的 JSON-per-line 为主，当前直接解析 .types 和 .rules，.cgroups 会提示并忽略。
-- 项目使用 anyhow、tokio、clap、tracing、regex、glob、serde/serde_json 等常见 Rust 生态库。
