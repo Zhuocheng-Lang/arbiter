@@ -1,0 +1,19 @@
+# Maintainer: Zhuocheng-Lang <https://github.com/Zhuocheng-Lang>
+pkgname=arbiter-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="A non-intrusive process priority manager for Linux, designed as a companion to modern sched_ext (scx) schedulers"
+arch=('x86_64')
+url="https://github.com/Zhuocheng-Lang/arbiter"
+license=('MIT')
+provides=('arbiter')
+conflicts=('arbiter' 'arbiter-git')
+source=("${pkgname}-${pkgver}-x86_64.tar.gz::https://github.com/Zhuocheng-Lang/arbiter/releases/download/v${pkgver}/arbiter-${pkgver}-x86_64-linux.tar.gz")
+# sha256sums is updated automatically by the release workflow before publishing to AUR
+sha256sums=('PLACEHOLDER')
+
+package() {
+    cd "${srcdir}"
+    install -Dm755 arbiter "${pkgdir}/usr/bin/arbiter"
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}
