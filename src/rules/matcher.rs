@@ -122,8 +122,8 @@ impl Matcher {
                     .push(i as u32);
                 // Build prefix index for long names so truncated `comm` can still match.
                 if rule.name_lowercase.len() > MAX_COMM_LEN {
-                    let prefix = truncate_to_char_boundary(&rule.name_lowercase, MAX_COMM_LEN)
-                        .to_string();
+                    let prefix =
+                        truncate_to_char_boundary(&rule.name_lowercase, MAX_COMM_LEN).to_string();
                     prefix_index.entry(prefix).or_default().push(i as u32);
                 }
             }
@@ -149,8 +149,7 @@ impl Matcher {
 
         // Check whether any named rule *could* match before starting the scan.
         let any_keyed_candidate = self.name_index.contains_key(comm_lc.as_str())
-            || (ctx.comm.len() >= MAX_COMM_LEN
-                && self.prefix_index.contains_key(comm_lc.as_str()))
+            || (ctx.comm.len() >= MAX_COMM_LEN && self.prefix_index.contains_key(comm_lc.as_str()))
             || ctx
                 .exe_name_lowercase
                 .as_deref()
