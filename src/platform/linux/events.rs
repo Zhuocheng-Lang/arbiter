@@ -422,7 +422,14 @@ pub async fn start_event_stream(tx: mpsc::Sender<ProcEvent>) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let mut buf = vec![0u8; RECV_BUF];
         'recv_loop: loop {
-            let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            let n = unsafe {
+                libc::recv(
+                    fd.as_raw_fd(),
+                    buf.as_mut_ptr() as *mut libc::c_void,
+                    buf.len(),
+                    0,
+                )
+            };
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
