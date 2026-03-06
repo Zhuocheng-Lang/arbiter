@@ -1,7 +1,5 @@
 use std::path::Path;
 
-// ── ScxScheduler ──────────────────────────────────────────────────────────────
-
 /// The currently active sched-ext scheduler, or `None` if CFS is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScxScheduler {
@@ -21,26 +19,22 @@ impl std::fmt::Display for ScxScheduler {
             Self::Layered => write!(f, "scx_layered"),
             Self::Rusty => write!(f, "scx_rusty"),
             Self::Bpfland => write!(f, "scx_bpfland"),
-            Self::Unknown(s) => write!(f, "{s}"),
+            Self::Unknown(name) => write!(f, "{name}"),
             Self::None => write!(f, "none (CFS)"),
         }
     }
 }
 
-// ── Strategy ──────────────────────────────────────────────────────────────────
-
 /// How arbiter translates rules into kernel hints for the active scheduler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Strategy {
-    /// nice + cgroup.weight — respected by lavd, rusty, bpfland, and most
+    /// nice + cgroup.weight - respected by lavd, rusty, bpfland, and most
     /// scx schedulers that honour UNIX priority.
     NiceAndWeight,
-
-    /// Generate a scx_layered layer-spec JSON file so that layered can
-    /// automatically assign processes to layers via regex/comm rules.
+    /// Generate a scx_layered layer-spec JSON file so layered can
+    /// automatically assign processes to layers via regex or comm rules.
     LayeredJson,
-
-    /// Fallback on a plain CFS system: nice / ionice / oom_score_adj only.
+    /// Fallback on a plain CFS system: nice, ionice, and oom_score_adj only.
     BasicHints,
 }
 
@@ -54,13 +48,7 @@ impl ScxScheduler {
     }
 }
 
-// ── Detection ─────────────────────────────────────────────────────────────────
-
-/// Probe sysfs to identify the running scx scheduler (if any).
-///
-/// Reads:
-///   `/sys/kernel/sched_ext/state`        → "enabled" or "disabled"
-///   `/sys/kernel/sched_ext/root/ops`     → scheduler name, e.g. "scx_lavd"
+/// Probe sysfs to identify the running scx scheduler, if any.
 pub fn detect() -> ScxScheduler {
     let state_path = Path::new("/sys/kernel/sched_ext/state");
     if !state_path.exists() {
@@ -68,7 +56,7 @@ pub fn detect() -> ScxScheduler {
     }
 
     let state = match std::fs::read_to_string(state_path) {
-        Ok(s) => s.trim().to_string(),
+        Ok(state) => state.trim().to_string(),
         Err(_) => return ScxScheduler::None,
     };
 
@@ -78,16 +66,13 @@ pub fn detect() -> ScxScheduler {
 
     let ops_path = Path::new("/sys/kernel/sched_ext/root/ops");
     let name = match std::fs::read_to_string(ops_path) {
-        Ok(s) => s.trim().to_string(),
-        Err(e) => {
-            tracing::warn!("Could not read sched_ext ops: {e}");
+        Ok(name) => name.trim().to_string(),
+        Err(err) => {
+            tracing::warn!("Could not read sched_ext ops: {err}");
             return ScxScheduler::Unknown("unknown".to_string());
         }
     };
 
-    // The ops name reported by the kernel may include a version suffix,
-    // e.g. "lavd_1.0.21_g7298f797_x86_64_unknown_linux_gnu".
-    // Match by prefix rather than exact name.
     let name_lc = name.to_lowercase();
     if name_lc.starts_with("scx_lavd") || name_lc.starts_with("lavd") {
         ScxScheduler::Lavd

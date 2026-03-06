@@ -1,8 +1,7 @@
+pub mod app;
 pub mod applier;
 pub mod cli;
 pub mod config;
 pub mod daemon;
-pub mod matcher;
-pub mod proc_events;
+pub mod platform;
 pub mod rules;
-pub mod scx;

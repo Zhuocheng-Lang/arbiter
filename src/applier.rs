@@ -8,9 +8,8 @@ use std::path::{Component, Path};
 use anyhow::{Context, Result, bail};
 
 use crate::config::Config;
-use crate::matcher::ProcessContext;
-use crate::rules::{IoClass, ResolvedRule};
-use crate::scx::{ScxScheduler, Strategy};
+use crate::platform::linux::{ScxScheduler, Strategy};
+use crate::rules::{IoClass, ProcessContext, ResolvedRule};
 
 // ── ApplyResult ───────────────────────────────────────────────────────────────
 
@@ -70,55 +69,55 @@ impl Applier {
         let strategy = scheduler.strategy();
 
         // ── nice ─────────────────────────────────────────────────────────────
-        if self.config.apply_nice {
-            if let Some(mut nice) = rule.nice {
-                nice = nice.clamp(-20, 19);
-                match self.set_nice(ctx.pid, nice) {
-                    Ok(()) => result.nice_applied = Some(nice),
-                    Err(e) => tracing::warn!(pid = ctx.pid, "nice={nice} failed: {e}"),
-                }
+        if self.config.apply_nice
+            && let Some(mut nice) = rule.nice
+        {
+            nice = nice.clamp(-20, 19);
+            match self.set_nice(ctx.pid, nice) {
+                Ok(()) => result.nice_applied = Some(nice),
+                Err(e) => tracing::warn!(pid = ctx.pid, "nice={nice} failed: {e}"),
             }
         }
 
         // ── ionice ───────────────────────────────────────────────────────────
-        if self.config.apply_ionice {
-            if let Some(ioclass) = rule.ioclass {
-                let level = rule.ionice.unwrap_or(4).clamp(0, 7);
-                match self.set_ionice(ctx.pid, ioclass, level) {
-                    Ok(()) => result.ionice_applied = true,
-                    Err(e) => tracing::warn!(pid = ctx.pid, "ionice failed: {e}"),
-                }
+        if self.config.apply_ionice
+            && let Some(ioclass) = rule.ioclass
+        {
+            let level = rule.ionice.unwrap_or(4).clamp(0, 7);
+            match self.set_ionice(ctx.pid, ioclass, level) {
+                Ok(()) => result.ionice_applied = true,
+                Err(e) => tracing::warn!(pid = ctx.pid, "ionice failed: {e}"),
             }
         }
 
         // ── oom_score_adj ────────────────────────────────────────────────────
-        if self.config.apply_oom {
-            if let Some(mut oom) = rule.oom_score_adj {
-                oom = oom.clamp(-1000, 1000);
-                match self.set_oom_score_adj(ctx.pid, oom) {
-                    Ok(()) => result.oom_applied = Some(oom),
-                    Err(e) => tracing::warn!(pid = ctx.pid, "oom_score_adj={oom} failed: {e}"),
-                }
+        if self.config.apply_oom
+            && let Some(mut oom) = rule.oom_score_adj
+        {
+            oom = oom.clamp(-1000, 1000);
+            match self.set_oom_score_adj(ctx.pid, oom) {
+                Ok(()) => result.oom_applied = Some(oom),
+                Err(e) => tracing::warn!(pid = ctx.pid, "oom_score_adj={oom} failed: {e}"),
             }
         }
 
         // ── cgroup placement ─────────────────────────────────────────────────
-        if self.config.apply_cgroup {
-            if let Some(ref cgroup) = rule.cgroup {
-                let weight = Self::effective_cgroup_weight(strategy, rule.cgroup_weight);
-                match self.move_to_cgroup(ctx.pid, cgroup, weight) {
-                    Ok(()) => result.cgroup_applied = Some(cgroup.clone()),
-                    Err(e) => tracing::warn!(pid = ctx.pid, cgroup, "cgroup move failed: {e}"),
-                }
+        if self.config.apply_cgroup
+            && let Some(ref cgroup) = rule.cgroup
+        {
+            let weight = Self::effective_cgroup_weight(strategy, rule.cgroup_weight);
+            match self.move_to_cgroup(ctx.pid, cgroup, weight) {
+                Ok(()) => result.cgroup_applied = Some(cgroup.clone()),
+                Err(e) => tracing::warn!(pid = ctx.pid, cgroup, "cgroup move failed: {e}"),
             }
         }
 
         // ── scx_layered: export layer JSON ───────────────────────────────────
-        if strategy == Strategy::LayeredJson {
-            if let Some(ref path) = self.config.layered_export_path {
-                // Deferred: layered export collects all rules and writes once.
-                tracing::debug!("layered export target: {}", path.display());
-            }
+        if strategy == Strategy::LayeredJson
+            && let Some(ref path) = self.config.layered_export_path
+        {
+            // Deferred: layered export collects all rules and writes once.
+            tracing::debug!("layered export target: {}", path.display());
         }
 
         tracing::info!(
@@ -285,7 +284,7 @@ impl Applier {
 #[cfg(test)]
 mod tests {
     use super::Applier;
-    use crate::scx::Strategy;
+    use crate::platform::linux::Strategy;
 
     #[test]
     fn rejects_unsafe_cgroup_paths() {

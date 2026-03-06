@@ -35,6 +35,22 @@ Arbiter does **not** replace your scx scheduler. It adjusts the process attribut
 - **Extended rule format** — Optional arbiter-specific fields for finer control, fully backwards-compatible
 - **Low overhead** — Written in Rust; event-driven architecture with negligible CPU usage at idle
 
+## Architecture
+
+The codebase is organized around three explicit layers:
+
+- **app** — command execution and startup orchestration
+- **rules** — rule loading, diagnostics, resolution, and matching
+- **platform/linux** — Linux-specific event streaming and scx scheduler detection
+
+The remaining top-level modules are intentionally narrow:
+
+- **daemon** owns runtime orchestration and signal handling
+- **applier** owns scheduler-aware application of resolved rules
+- **cli** and **config** define input models rather than business logic
+
+See [docs/architecture.md](docs/architecture.md) for the developer-facing layout and runtime flow.
+
 ## Requirements
 
 - Linux kernel ≥ 6.12 (for `sched_ext` support; arbiter also works without scx)

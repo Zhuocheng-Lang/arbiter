@@ -1,16 +1,15 @@
 //! Listens to the Linux kernel's process-connector (`CN_PROC`) via a raw
-//! `NETLINK_CONNECTOR` socket.  No BPF involved.
+//! `NETLINK_CONNECTOR` socket. No BPF involved.
 //!
 //! Kernel reference: `include/uapi/linux/cn_proc.h`
 
 use anyhow::{Result, bail};
 use std::io;
 use std::mem;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::raw::c_int;
 use std::ptr;
 use tokio::sync::mpsc;
-
-// ── ProcEvent (public) ────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
 pub enum ProcEvent {
@@ -21,8 +20,6 @@ pub enum ProcEvent {
     /// A process exited.
     Exit { pid: u32, exit_code: u32 },
 }
-
-// ── Netlink / CN_PROC constants ───────────────────────────────────────────────
 
 const NETLINK_CONNECTOR: c_int = 11;
 const CN_IDX_PROC: u32 = 1;
@@ -43,8 +40,6 @@ const NLM_F_ACK: u16 = 0x4;
 const CAP_NET_ADMIN: u32 = 12;
 const RECV_BUF: usize = 8192;
 const SOCKET_RCVBUF: c_int = 1 << 20;
-
-// ── Wire structs (all #[repr(C)] for correct ABI layout) ─────────────────────
 
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -73,7 +68,6 @@ struct CnMsg {
     flags: u16,
 }
 
-/// The first three fields of every `proc_event` union.
 #[repr(C)]
 #[derive(Copy, Clone)]
 struct ProcEventHdr {
@@ -82,7 +76,6 @@ struct ProcEventHdr {
     timestamp_ns: u64,
 }
 
-/// Subscribe message sent to the kernel to start receiving proc events.
 #[repr(C)]
 struct SubscribeMsg {
     nl_hdr: NlMsgHdr,
@@ -103,22 +96,19 @@ enum ParsedNetlinkMessage {
     Error(i32),
 }
 
-// ── Socket helpers ────────────────────────────────────────────────────────────
-
-fn create_nl_socket() -> Result<c_int> {
-    let fd = unsafe {
+fn create_nl_socket() -> Result<OwnedFd> {
+    let raw = unsafe {
         libc::socket(
             libc::AF_NETLINK,
             libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
             NETLINK_CONNECTOR,
         )
     };
-    if fd < 0 {
+    if raw < 0 {
         bail!("socket(NETLINK_CONNECTOR): {}", io::Error::last_os_error());
     }
+    let owned = unsafe { OwnedFd::from_raw_fd(raw) };
 
-    // Use zeroed() to avoid depending on the exact field layout / padding types
-    // in different libc versions.
     let mut addr: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     addr.nl_family = libc::AF_NETLINK as u16;
     addr.nl_pid = unsafe { libc::getpid() as u32 };
@@ -126,20 +116,19 @@ fn create_nl_socket() -> Result<c_int> {
 
     let ret = unsafe {
         libc::bind(
-            fd,
+            owned.as_raw_fd(),
             &addr as *const _ as *const libc::sockaddr,
             mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
         )
     };
     if ret < 0 {
-        unsafe { libc::close(fd) };
         bail!("bind(NETLINK_CONNECTOR): {}", io::Error::last_os_error());
     }
 
     let rcvbuf: c_int = SOCKET_RCVBUF;
     let ret = unsafe {
         libc::setsockopt(
-            fd,
+            owned.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVBUF,
             &rcvbuf as *const _ as *const libc::c_void,
@@ -153,11 +142,11 @@ fn create_nl_socket() -> Result<c_int> {
         );
     }
 
-    Ok(fd)
+    Ok(owned)
 }
 
 fn send_subscribe(fd: c_int) -> Result<()> {
-    let cn_data_len = mem::size_of::<u32>() as u16; // just the `op` field
+    let cn_data_len = mem::size_of::<u32>() as u16;
     let total_len = mem::size_of::<SubscribeMsg>() as u32;
 
     let msg = SubscribeMsg {
@@ -201,8 +190,6 @@ fn send_subscribe(fd: c_int) -> Result<()> {
     }
     Ok(())
 }
-
-// ── Parsing ───────────────────────────────────────────────────────────────────
 
 fn read_copy<T: Copy>(buf: &[u8]) -> Option<T> {
     if buf.len() < mem::size_of::<T>() {
@@ -292,17 +279,17 @@ fn parse_messages(buf: &[u8]) -> Vec<ParsedNetlinkMessage> {
 
         let msg_len = hdr.nlmsg_len as usize;
         if msg_len < nl_sz || offset + msg_len > buf.len() {
-            tracing::debug!(nlmsg_len = hdr.nlmsg_len, remaining = buf.len() - offset, "dropping malformed netlink message");
+            tracing::debug!(
+                nlmsg_len = hdr.nlmsg_len,
+                remaining = buf.len() - offset,
+                "dropping malformed netlink message"
+            );
             break;
         }
 
         let payload = &buf[offset + nl_sz..offset + msg_len];
         match hdr.nlmsg_type {
-            NLMSG_NOOP | NLMSG_DONE => {
-                // NLMSG_DONE marks end-of-multipart-dump; NLMSG_NOOP is a no-op.
-                // Neither is an ACK for our subscription request — only
-                // NLMSG_ERROR(error=0) constitutes an ACK per netlink convention.
-            }
+            NLMSG_NOOP | NLMSG_DONE => {}
             NLMSG_ERROR => match parse_nlmsg_error(payload) {
                 Some(0) => messages.push(ParsedNetlinkMessage::Ack),
                 Some(errno) => messages.push(ParsedNetlinkMessage::Error(errno)),
@@ -348,7 +335,10 @@ fn recv_subscribe_ack(fd: c_int) -> Result<()> {
             match message {
                 ParsedNetlinkMessage::Ack => return Ok(()),
                 ParsedNetlinkMessage::Error(errno) => {
-                    bail!("kernel rejected CN_PROC subscription: {}", io::Error::from_raw_os_error(-errno));
+                    bail!(
+                        "kernel rejected CN_PROC subscription: {}",
+                        io::Error::from_raw_os_error(-errno)
+                    );
                 }
                 ParsedNetlinkMessage::ProcEvent(_) => {
                     tracing::debug!("received CN_PROC event before subscription ACK");
@@ -362,8 +352,16 @@ fn has_effective_capability(cap: u32) -> io::Result<bool> {
     let status = std::fs::read_to_string("/proc/self/status")?;
     let raw = status
         .lines()
-        .find_map(|line| line.strip_prefix("CapEff:\t").or_else(|| line.strip_prefix("CapEff:")))
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "CapEff missing from /proc/self/status"))?
+        .find_map(|line| {
+            line.strip_prefix("CapEff:\t")
+                .or_else(|| line.strip_prefix("CapEff:"))
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "CapEff missing from /proc/self/status",
+            )
+        })?
         .trim();
 
     let effective = u64::from_str_radix(raw, 16)
@@ -372,12 +370,8 @@ fn has_effective_capability(cap: u32) -> io::Result<bool> {
     Ok((effective & (1u64 << cap)) != 0)
 }
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
 /// Spawn a background thread that reads CN_PROC events and forwards them to
-/// `tx`.  Returns immediately; the thread runs until the channel is closed.
-///
-/// Requires `CAP_NET_ADMIN` (or root) to receive system-wide events.
+/// `tx`. Returns immediately; the thread runs until the channel is closed.
 pub async fn start_event_stream(tx: mpsc::Sender<ProcEvent>) -> Result<()> {
     match has_effective_capability(CAP_NET_ADMIN) {
         Ok(true) => {}
@@ -393,32 +387,30 @@ pub async fn start_event_stream(tx: mpsc::Sender<ProcEvent>) -> Result<()> {
     }
 
     let fd = create_nl_socket()?;
-    if let Err(err) = send_subscribe(fd) {
-        unsafe { libc::close(fd) };
-        return Err(err);
-    }
-    // Bound the blocking recv in recv_subscribe_ack: if the kernel never ACKs
-    // (old kernel, unusual config), we must not stall the tokio worker thread
-    // indefinitely.  5 s is generous; in practice the ACK arrives in < 1 ms.
-    let ack_timeout = libc::timeval { tv_sec: 5, tv_usec: 0 };
+    send_subscribe(fd.as_raw_fd())?;
+
+    let ack_timeout = libc::timeval {
+        tv_sec: 5,
+        tv_usec: 0,
+    };
     unsafe {
         libc::setsockopt(
-            fd,
+            fd.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
             &ack_timeout as *const _ as *const libc::c_void,
             mem::size_of::<libc::timeval>() as libc::socklen_t,
         );
     }
-    if let Err(err) = recv_subscribe_ack(fd) {
-        unsafe { libc::close(fd) };
-        return Err(err);
-    }
-    // Clear the timeout before handing fd to the streaming thread.
-    let no_timeout = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    recv_subscribe_ack(fd.as_raw_fd())?;
+
+    let no_timeout = libc::timeval {
+        tv_sec: 0,
+        tv_usec: 0,
+    };
     unsafe {
         libc::setsockopt(
-            fd,
+            fd.as_raw_fd(),
             libc::SOL_SOCKET,
             libc::SO_RCVTIMEO,
             &no_timeout as *const _ as *const libc::c_void,
@@ -430,14 +422,16 @@ pub async fn start_event_stream(tx: mpsc::Sender<ProcEvent>) -> Result<()> {
     tokio::task::spawn_blocking(move || {
         let mut buf = vec![0u8; RECV_BUF];
         'recv_loop: loop {
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
+            let n = unsafe { libc::recv(fd.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len(), 0) };
             if n < 0 {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
                     continue;
                 }
                 if err.raw_os_error() == Some(libc::ENOBUFS) {
-                    tracing::warn!("CN_PROC receive buffer overflowed; some process events were dropped");
+                    tracing::warn!(
+                        "CN_PROC receive buffer overflowed; some process events were dropped"
+                    );
                     continue;
                 }
                 tracing::error!("recv(CN_PROC): {err}");
@@ -466,7 +460,6 @@ pub async fn start_event_stream(tx: mpsc::Sender<ProcEvent>) -> Result<()> {
                 }
             }
         }
-        unsafe { libc::close(fd) };
     });
 
     Ok(())
@@ -486,10 +479,7 @@ mod tests {
         };
 
         unsafe {
-            std::slice::from_raw_parts(
-                &hdr as *const _ as *const u8,
-                mem::size_of::<NlMsgHdr>(),
-            )
+            std::slice::from_raw_parts(&hdr as *const _ as *const u8, mem::size_of::<NlMsgHdr>())
         }
         .to_vec()
     }
@@ -552,10 +542,7 @@ mod tests {
         };
 
         let payload = unsafe {
-            std::slice::from_raw_parts(
-                &err as *const _ as *const u8,
-                mem::size_of::<NlMsgErr>(),
-            )
+            std::slice::from_raw_parts(&err as *const _ as *const u8, mem::size_of::<NlMsgErr>())
         };
 
         let mut message = nl_hdr(NLMSG_ERROR, payload.len());
@@ -620,7 +607,19 @@ mod tests {
 
         let parsed = parse_messages(&buffer);
         assert_eq!(parsed.len(), 2);
-        assert!(matches!(parsed[0], ParsedNetlinkMessage::ProcEvent(ProcEvent::Exec { pid: 123, tgid: 123 })));
-        assert!(matches!(parsed[1], ParsedNetlinkMessage::ProcEvent(ProcEvent::Exit { pid: 123, exit_code: 42 })));
+        assert!(matches!(
+            parsed[0],
+            ParsedNetlinkMessage::ProcEvent(ProcEvent::Exec {
+                pid: 123,
+                tgid: 123
+            })
+        ));
+        assert!(matches!(
+            parsed[1],
+            ParsedNetlinkMessage::ProcEvent(ProcEvent::Exit {
+                pid: 123,
+                exit_code: 42
+            })
+        ));
     }
 }

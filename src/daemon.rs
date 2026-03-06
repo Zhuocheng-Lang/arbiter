@@ -8,10 +8,8 @@ use tokio::sync::{RwLock, mpsc};
 
 use crate::applier::Applier;
 use crate::config::Config;
-use crate::matcher::{Matcher, ProcessContext};
-use crate::proc_events::{ProcEvent, start_event_stream};
-use crate::rules::RuleSet;
-use crate::scx;
+use crate::platform::linux::{self, ProcEvent, start_event_stream};
+use crate::rules::{Matcher, ProcessContext, RuleSet};
 
 const EXEC_QUEUE_CAPACITY: usize = 2048;
 const EXEC_WORKERS: usize = 32;
@@ -36,7 +34,7 @@ impl Daemon {
         // ── build shared components ───────────────────────────────────────────
         let matcher = Arc::new(RwLock::new(Matcher::new(resolved)));
         let applier = Arc::new(Applier::new(self.config.clone()));
-        let scheduler = Arc::new(scx::detect());
+        let scheduler = Arc::new(linux::detect());
         let delay_ms = self.config.exec_delay_ms;
         let rules_dirs = self.config.rules_dirs.clone();
 
