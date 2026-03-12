@@ -184,18 +184,18 @@ impl Matcher {
         if let Some(indices) = self.name_index.get(comm_lc.as_str()) {
             candidates.extend_from_slice(indices);
         }
-        if ctx.comm.len() >= MAX_COMM_LEN {
-            if let Some(indices) = self.prefix_index.get(comm_lc.as_str()) {
-                candidates.extend_from_slice(indices);
-            }
+        if ctx.comm.len() >= MAX_COMM_LEN
+            && let Some(indices) = self.prefix_index.get(comm_lc.as_str())
+        {
+            candidates.extend_from_slice(indices);
         }
         if let Some(exe_lc) = ctx.exe_name_lowercase.as_deref() {
             // Skip when exe basename equals comm — already covered by the
             // lookup above; avoids duplicate entries before dedup.
-            if exe_lc != comm_lc.as_str() {
-                if let Some(indices) = self.name_index.get(exe_lc) {
-                    candidates.extend_from_slice(indices);
-                }
+            if exe_lc != comm_lc.as_str()
+                && let Some(indices) = self.name_index.get(exe_lc)
+            {
+                candidates.extend_from_slice(indices);
             }
         }
 
