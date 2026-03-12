@@ -72,20 +72,14 @@ impl Daemon {
                     tokio::spawn(async move {
                         let _permit = permit;
 
-                        // Give the process a moment to finish execve and
-                        // populate /proc/<pid>/{comm, exe, cmdline}.
-                        if delay_ms > 0 {
-                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-                        }
-
-                        match ProcessContext::from_pid(pid) {
+                        match load_process_context(pid, delay_ms).await {
                             Ok(ctx) => {
                                 let rule = {
                                     let guard = m.read().await;
-                                    guard.find_match(&ctx).cloned()
+                                    guard.find_match(&ctx)
                                 };
                                 if let Some(rule) = rule {
-                                    if let Err(e) = a.apply(&ctx, &rule, &s) {
+                                    if let Err(e) = a.apply(&ctx, rule.as_ref(), &s) {
                                         tracing::warn!(pid, "apply failed: {e}");
                                     }
                                 } else {
@@ -171,5 +165,43 @@ impl Daemon {
         drop(exec_tx);
 
         Ok(())
+    }
+}
+
+fn process_context_needs_retry(ctx: &ProcessContext) -> bool {
+    ctx.exe.is_none() || ctx.cmdline.is_none()
+}
+
+async fn load_process_context(pid: u32, max_wait_ms: u64) -> Result<ProcessContext> {
+    let mut waited_ms = 0u64;
+    let mut backoff_ms = 1u64;
+    let mut last_partial = None;
+
+    loop {
+        match ProcessContext::from_pid(pid) {
+            Ok(ctx) => {
+                if waited_ms >= max_wait_ms || !process_context_needs_retry(&ctx) {
+                    return Ok(ctx);
+                }
+                last_partial = Some(ctx);
+            }
+            Err(err) => {
+                if waited_ms >= max_wait_ms {
+                    return last_partial.ok_or(err);
+                }
+            }
+        }
+
+        let remaining_ms = max_wait_ms.saturating_sub(waited_ms);
+        if remaining_ms == 0 {
+            return last_partial.ok_or_else(|| {
+                anyhow::anyhow!("process context for pid {pid} was unavailable within retry budget")
+            });
+        }
+
+        let sleep_ms = backoff_ms.min(remaining_ms);
+        tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+        waited_ms += sleep_ms;
+        backoff_ms = (backoff_ms.saturating_mul(2)).min(8);
     }
 }

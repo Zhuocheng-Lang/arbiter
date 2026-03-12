@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::Result;
 
@@ -8,6 +9,10 @@ use super::ResolvedRule;
 /// TASK_COMM_LEN constant (16), which includes the NUL terminator,
 /// so the usable maximum is 15 characters.
 const MAX_COMM_LEN: usize = 15;
+/// Maximum bytes retained from `/proc/PID/cmdline` after joining argv.
+/// Guards against large argv (e.g. Java, Electron) causing unbounded I/O
+/// and substring-match cost in `cmdline_contains` rules.
+const MAX_CMDLINE_BYTES: usize = 4096;
 
 fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
     if s.len() <= max_bytes {
@@ -54,7 +59,18 @@ impl ProcessContext {
             .cmdline()
             .ok()
             .filter(|args| !args.is_empty())
-            .map(|args| args.join(" "));
+            .map(|args| {
+                let mut joined = args.join(" ");
+                if joined.len() > MAX_CMDLINE_BYTES {
+                    // Truncate at a char boundary to avoid splitting a UTF-8 sequence.
+                    let mut end = MAX_CMDLINE_BYTES;
+                    while !joined.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    joined.truncate(end);
+                }
+                joined
+            });
 
         let comm_lowercase = stat.comm.to_lowercase();
         let exe_name_lowercase = exe
@@ -94,7 +110,7 @@ impl ProcessContext {
 }
 
 pub struct Matcher {
-    rules: Vec<ResolvedRule>,
+    rules: Vec<Arc<ResolvedRule>>,
     /// Exact name lookup: `name_lowercase` → sorted rule indices.
     /// Covers the vast majority of named rules.
     name_index: HashMap<String, Vec<u32>>,
@@ -108,6 +124,7 @@ pub struct Matcher {
 
 impl Matcher {
     pub fn new(rules: Vec<ResolvedRule>) -> Self {
+        let rules: Vec<_> = rules.into_iter().map(Arc::new).collect();
         let mut name_index: HashMap<String, Vec<u32>> = HashMap::with_capacity(rules.len());
         let mut prefix_index: HashMap<String, Vec<u32>> = HashMap::new();
         let mut has_nameless = false;
@@ -139,30 +156,61 @@ impl Matcher {
 
     /// Return the first rule that matches `ctx`, or `None`.
     ///
-    /// Fast path: if neither `comm_lowercase` nor `exe_name_lowercase` appears
-    /// in any rule's name (and there are no nameless rules), we return `None`
-    /// immediately without iterating over the rule list at all.  This is the
-    /// common case — most short-lived processes (`ls`, `sh`, ...) have no
-    /// matching rule and would otherwise trigger an O(n) scan.
-    pub fn find_match<'a>(&'a self, ctx: &ProcessContext) -> Option<&'a ResolvedRule> {
+    /// When no nameless rules exist (the common case — the loader rejects
+    /// empty-name entries), the name index is used to collect only the rule
+    /// indices that share a name with this process.  Those candidates are
+    /// checked in their original order (first-match-wins).  Processes that
+    /// match no indexed name are rejected in O(1) without any rule iteration.
+    ///
+    /// Falls back to a full O(n) scan only when nameless rules are present,
+    /// because a nameless rule can match any process at any list position.
+    pub fn find_match(&self, ctx: &ProcessContext) -> Option<Arc<ResolvedRule>> {
+        // Nameless rules can match any process; full scan required for ordering.
+        if self.has_nameless {
+            return self
+                .rules
+                .iter()
+                .find(|rule| self.rule_matches(rule.as_ref(), ctx))
+                .cloned();
+        }
+
+        // Collect candidate indices for every name that could match this
+        // context.  Each Vec in the index was built by iterating rules in
+        // ascending order, so merging + sort_unstable + dedup preserves the
+        // original rule priority (first-match-wins).
         let comm_lc = &ctx.comm_lowercase;
+        let mut candidates: Vec<u32> = Vec::new();
 
-        // Check whether any named rule *could* match before starting the scan.
-        let any_keyed_candidate = self.name_index.contains_key(comm_lc.as_str())
-            || (ctx.comm.len() >= MAX_COMM_LEN && self.prefix_index.contains_key(comm_lc.as_str()))
-            || ctx
-                .exe_name_lowercase
-                .as_deref()
-                .map(|n| self.name_index.contains_key(n))
-                .unwrap_or(false);
+        if let Some(indices) = self.name_index.get(comm_lc.as_str()) {
+            candidates.extend_from_slice(indices);
+        }
+        if ctx.comm.len() >= MAX_COMM_LEN {
+            if let Some(indices) = self.prefix_index.get(comm_lc.as_str()) {
+                candidates.extend_from_slice(indices);
+            }
+        }
+        if let Some(exe_lc) = ctx.exe_name_lowercase.as_deref() {
+            // Skip when exe basename equals comm — already covered by the
+            // lookup above; avoids duplicate entries before dedup.
+            if exe_lc != comm_lc.as_str() {
+                if let Some(indices) = self.name_index.get(exe_lc) {
+                    candidates.extend_from_slice(indices);
+                }
+            }
+        }
 
-        if !any_keyed_candidate && !self.has_nameless {
-            // Fast-reject: no rule in the set can possibly match this process.
+        if candidates.is_empty() {
             return None;
         }
 
-        // Linear scan is kept for correctness (first-match-wins, prefix matching).
-        self.rules.iter().find(|rule| self.rule_matches(rule, ctx))
+        candidates.sort_unstable();
+        candidates.dedup();
+
+        candidates.iter().find_map(|&idx| {
+            let rule = &self.rules[idx as usize];
+            self.rule_matches(rule.as_ref(), ctx)
+                .then(|| Arc::clone(rule))
+        })
     }
 
     /// Describe the matching process for debugging.
@@ -170,10 +218,10 @@ impl Matcher {
         let mut attempts = Vec::new();
         let mut matched = None;
         for rule in &self.rules {
-            let hit = self.rule_matches(rule, ctx);
+            let hit = self.rule_matches(rule.as_ref(), ctx);
             attempts.push((rule.name.clone(), hit));
             if hit && matched.is_none() {
-                matched = Some(rule.clone());
+                matched = Some(Arc::clone(rule));
             }
         }
         ExplainResult { matched, attempts }
@@ -218,7 +266,7 @@ impl Matcher {
 
 pub struct ExplainResult {
     /// The first matching rule, if any.
-    pub matched: Option<ResolvedRule>,
+    pub matched: Option<Arc<ResolvedRule>>,
     /// `(rule_name, did_match)` for every rule checked.
     pub attempts: Vec<(String, bool)>,
 }
