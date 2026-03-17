@@ -18,7 +18,7 @@ use crate::rules::{IoClass, ProcessContext, ResolvedRule};
 pub struct ApplyResult {
     pub dry_run: bool,
     pub nice_applied: Option<i32>,
-    pub ionice_applied: bool,
+    pub io_weight_applied: Option<u16>,
     pub oom_applied: Option<i32>,
     pub cgroup_applied: Option<String>,
 }
@@ -79,16 +79,11 @@ impl Applier {
             }
         }
 
-        // ── ionice ───────────────────────────────────────────────────────────
-        if self.config.apply_ionice
-            && let Some(ioclass) = rule.ioclass
-        {
-            let level = rule.ionice.unwrap_or(4).clamp(0, 7);
-            match self.set_ionice(ctx.pid, ioclass, level) {
-                Ok(()) => result.ionice_applied = true,
-                Err(e) => tracing::warn!(pid = ctx.pid, "ionice failed: {e}"),
-            }
-        }
+        let io_weight = if self.config.apply_ionice {
+            Self::ionice_to_io_weight(rule.ioclass, rule.ionice)
+        } else {
+            None
+        };
 
         // ── oom_score_adj ────────────────────────────────────────────────────
         if self.config.apply_oom
@@ -106,10 +101,19 @@ impl Applier {
             && let Some(ref cgroup) = rule.cgroup
         {
             let weight = Self::effective_cgroup_weight(strategy, rule.cgroup_weight);
-            match self.move_to_cgroup(ctx.pid, cgroup, weight) {
-                Ok(()) => result.cgroup_applied = Some(cgroup.clone()),
+            match self.move_to_cgroup(ctx.pid, cgroup, weight, io_weight) {
+                Ok(applied_io_weight) => {
+                    result.cgroup_applied = Some(cgroup.clone());
+                    result.io_weight_applied = applied_io_weight;
+                }
                 Err(e) => tracing::warn!(pid = ctx.pid, cgroup, "cgroup move failed: {e}"),
             }
+        } else if io_weight.is_some() {
+            tracing::debug!(
+                pid = ctx.pid,
+                rule = %rule.name,
+                "ionice configured but no cgroup target; skipping io.weight"
+            );
         }
 
         // ── scx_layered: export layer JSON ───────────────────────────────────
@@ -143,28 +147,10 @@ impl Applier {
         Ok(())
     }
 
-    fn set_ionice(&self, pid: u32, ioclass: IoClass, level: u8) -> Result<()> {
-        // ioprio value: (class << 13) | (level & 0x7)
-        let ioprio: u32 = (ioclass.as_linux_class() << 13) | (level as u32 & 0x7);
-        let ret = unsafe { libc::syscall(libc::SYS_ioprio_set, 1i64, pid as i64, ioprio as i64) };
-        if ret != 0 {
-            bail!("ioprio_set: {}", std::io::Error::last_os_error());
-        }
-        Ok(())
-    }
-
     fn set_oom_score_adj(&self, pid: u32, score: i32) -> Result<()> {
-        use std::io::{Cursor, Write as _};
-        // Stack-allocate the value string ("-1000\n" = 6 bytes max) to avoid
-        // a heap allocation per process event.
         let path = CString::new(format!("/proc/{pid}/oom_score_adj"))
             .expect("proc path is always valid ASCII");
-        let mut val_buf = [0u8; 8];
-        let val_len = {
-            let mut c = Cursor::new(&mut val_buf[..]);
-            writeln!(c, "{score}").expect("val_buf too small");
-            c.position() as usize
-        };
+        let value = format!("{score}\n");
         let flags = libc::O_WRONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
         let fd = unsafe { libc::open(path.as_ptr(), flags) };
         if fd < 0 {
@@ -174,40 +160,33 @@ impl Applier {
             );
         }
         let mut file = unsafe { File::from_raw_fd(fd) };
-        file.write_all(&val_buf[..val_len])
+        file.write_all(value.as_bytes())
             .with_context(|| format!("write /proc/{pid}/oom_score_adj"))?;
         Ok(())
     }
 
     /// Move `pid` into the cgroup at `<cgroup_root>/<cgroup>` and optionally
-    /// set `cpu.weight`. Creates the cgroup directory if missing.
-    fn move_to_cgroup(&self, pid: u32, cgroup: &str, weight: Option<u64>) -> Result<()> {
-        use std::io::{Cursor, Write as _};
+    /// set `cpu.weight` and `io.weight`. Creates the cgroup directory if missing.
+    fn move_to_cgroup(
+        &self,
+        pid: u32,
+        cgroup: &str,
+        weight: Option<u64>,
+        io_weight: Option<u16>,
+    ) -> Result<Option<u16>> {
         let components = Self::validated_cgroup_components(cgroup)?;
         let cg_dir = self
             .open_cgroup_dir(&components)
             .with_context(|| format!("open cgroup dir for '{cgroup}'"))?;
 
-        // Stack-allocate pid and weight strings to avoid heap allocation per event.
-        let mut pid_buf = [0u8; 12]; // u32 max (4294967295) + '\n' = 11 bytes
-        let pid_len = {
-            let mut c = Cursor::new(&mut pid_buf[..]);
-            writeln!(c, "{pid}").expect("pid_buf too small");
-            c.position() as usize
-        };
-
-        self.write_control_file(&cg_dir, c"cgroup.procs", &pid_buf[..pid_len])
+        let pid_value = format!("{pid}\n");
+        self.write_control_file(&cg_dir, c"cgroup.procs", pid_value.as_bytes())
             .with_context(|| format!("write cgroup.procs for '{cgroup}'"))?;
 
         if let Some(w) = weight {
             let w = w.clamp(1, 10_000);
-            let mut wgt_buf = [0u8; 8]; // "10000\n" = 6 bytes
-            let wgt_len = {
-                let mut c = Cursor::new(&mut wgt_buf[..]);
-                writeln!(c, "{w}").expect("wgt_buf too small");
-                c.position() as usize
-            };
-            match self.write_control_file(&cg_dir, c"cpu.weight", &wgt_buf[..wgt_len]) {
+            let weight_value = format!("{w}\n");
+            match self.write_control_file(&cg_dir, c"cpu.weight", weight_value.as_bytes()) {
                 Ok(()) => {}
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
                     tracing::debug!(cgroup, "cpu.weight missing, skipping weight write");
@@ -218,7 +197,21 @@ impl Applier {
             }
         }
 
-        Ok(())
+        let mut applied_io_weight = None;
+        if let Some(w) = io_weight {
+            let io_weight_value = format!("{w}\n");
+            match self.write_control_file(&cg_dir, c"io.weight", io_weight_value.as_bytes()) {
+                Ok(()) => applied_io_weight = Some(w),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                    tracing::debug!(cgroup, "io.weight missing, skipping io weight write");
+                }
+                Err(err) => {
+                    return Err(err).with_context(|| format!("write io.weight for '{cgroup}'"));
+                }
+            }
+        }
+
+        Ok(applied_io_weight)
     }
 
     fn effective_cgroup_weight(strategy: Strategy, configured_weight: Option<u64>) -> Option<u64> {
@@ -227,6 +220,21 @@ impl Applier {
         } else {
             None
         }
+    }
+
+    fn ionice_to_io_weight(ioclass: Option<IoClass>, level: Option<u8>) -> Option<u16> {
+        let class = ioclass?;
+        let prio = level.unwrap_or(4).clamp(0, 7) as u16;
+
+        // Map ananicy-cpp ionice semantics to cgroup v2 io.weight.
+        let weight = match class {
+            IoClass::RealTime => 800 + ((7 - prio) * 200) / 7,
+            IoClass::BestEffort => 100 + ((7 - prio) * 700) / 7,
+            IoClass::Idle => 1 + ((7 - prio) * 49) / 7,
+            IoClass::None => return None,
+        };
+
+        Some(weight)
     }
 
     fn validated_cgroup_components(cgroup: &str) -> Result<Vec<CString>> {
@@ -263,12 +271,31 @@ impl Applier {
         Ok(components)
     }
 
+    fn cgroup_base_components() -> Result<Vec<CString>> {
+        let uid = unsafe { libc::geteuid() };
+        Self::cgroup_base_components_for_uid(uid)
+    }
+
+    fn cgroup_base_components_for_uid(uid: u32) -> Result<Vec<CString>> {
+        let user_slice = format!("user-{uid}.slice");
+        let user_service = format!("user@{uid}.service");
+
+        Ok(vec![
+            CString::new("user.slice").expect("static string without NUL"),
+            CString::new(user_slice).context("invalid user slice name")?,
+            CString::new(user_service).context("invalid user service name")?,
+            CString::new("arbiter.slice").expect("static string without NUL"),
+        ])
+    }
+
     fn open_cgroup_dir(&self, components: &[CString]) -> Result<OwnedFd> {
         let root = CString::new("/sys/fs/cgroup").expect("static path without NUL");
         let root_fd = Self::open_dir_at(libc::AT_FDCWD, &root).context("open /sys/fs/cgroup")?;
+        let base_components =
+            Self::cgroup_base_components().context("resolve user cgroup scope")?;
 
         let mut current = root_fd;
-        for component in components {
+        for component in base_components.iter().chain(components.iter()) {
             let mkdir_ret =
                 unsafe { libc::mkdirat(current.as_raw_fd(), component.as_ptr(), 0o755) };
             if mkdir_ret != 0 {
@@ -320,6 +347,7 @@ impl Applier {
 mod tests {
     use super::Applier;
     use crate::platform::linux::Strategy;
+    use crate::rules::IoClass;
 
     #[test]
     fn rejects_unsafe_cgroup_paths() {
@@ -360,6 +388,57 @@ mod tests {
         assert_eq!(
             Applier::effective_cgroup_weight(Strategy::LayeredJson, Some(900)),
             None
+        );
+    }
+
+    #[test]
+    fn cgroup_base_scope_is_user_local_and_arbiter_scoped() {
+        let parts = Applier::cgroup_base_components_for_uid(1000).unwrap();
+        let text: Vec<String> = parts
+            .iter()
+            .map(|part| part.to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            text,
+            vec![
+                "user.slice".to_string(),
+                "user-1000.slice".to_string(),
+                "user@1000.service".to_string(),
+                "arbiter.slice".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn ionice_maps_to_expected_io_weight_ranges() {
+        assert_eq!(
+            Applier::ionice_to_io_weight(Some(IoClass::None), Some(0)),
+            None
+        );
+        assert_eq!(
+            Applier::ionice_to_io_weight(Some(IoClass::RealTime), Some(0)),
+            Some(1000)
+        );
+        assert_eq!(
+            Applier::ionice_to_io_weight(Some(IoClass::RealTime), Some(7)),
+            Some(800)
+        );
+        assert_eq!(
+            Applier::ionice_to_io_weight(Some(IoClass::BestEffort), Some(0)),
+            Some(800)
+        );
+        assert_eq!(
+            Applier::ionice_to_io_weight(Some(IoClass::BestEffort), Some(7)),
+            Some(100)
+        );
+        assert_eq!(
+            Applier::ionice_to_io_weight(Some(IoClass::Idle), Some(0)),
+            Some(50)
+        );
+        assert_eq!(
+            Applier::ionice_to_io_weight(Some(IoClass::Idle), Some(7)),
+            Some(1)
         );
     }
 }

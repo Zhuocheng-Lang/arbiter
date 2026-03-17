@@ -10,7 +10,11 @@ use crate::platform::linux;
 use crate::rules::{Matcher, ProcessContext, RuleSet};
 
 pub async fn run(cli: Cli) -> Result<()> {
-    let mut config = load_config(&cli)?;
+    let mut config = if let Some(path) = &cli.config {
+        Config::load_from(path)?
+    } else {
+        Config::load()?
+    };
 
     match cli.command {
         Commands::Daemon { dry_run } => {
@@ -23,13 +27,6 @@ pub async fn run(cli: Cli) -> Result<()> {
         Commands::Explain { target } => run_explain(&config, &target),
         Commands::Status => run_status(&config),
         Commands::Check { path } => run_check(&config, path),
-    }
-}
-
-fn load_config(cli: &Cli) -> Result<Config> {
-    match &cli.config {
-        Some(path) => Config::load_from(path),
-        None => Config::load(),
     }
 }
 

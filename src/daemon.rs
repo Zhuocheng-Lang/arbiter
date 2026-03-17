@@ -43,7 +43,7 @@ impl Daemon {
         tracing::info!(scheduler = %scheduler, profile = %self.config.profile, "Arbiter starting");
 
         // ── open proc-connector channel ───────────────────────────────────────
-        let (tx, mut rx) = mpsc::channel::<ProcEvent>(2048);
+        let (tx, mut rx) = mpsc::channel::<ProcEvent>(EXEC_QUEUE_CAPACITY);
         start_event_stream(tx).await?;
 
         // ── exec queue + concurrency limiter ─────────────────────────────────
@@ -168,10 +168,6 @@ impl Daemon {
     }
 }
 
-fn process_context_needs_retry(ctx: &ProcessContext) -> bool {
-    ctx.exe.is_none() || ctx.cmdline.is_none()
-}
-
 async fn load_process_context(pid: u32, max_wait_ms: u64) -> Result<ProcessContext> {
     let mut waited_ms = 0u64;
     let mut backoff_ms = 1u64;
@@ -180,7 +176,7 @@ async fn load_process_context(pid: u32, max_wait_ms: u64) -> Result<ProcessConte
     loop {
         match ProcessContext::from_pid(pid) {
             Ok(ctx) => {
-                if waited_ms >= max_wait_ms || !process_context_needs_retry(&ctx) {
+                if waited_ms >= max_wait_ms || (ctx.exe.is_some() && ctx.cmdline.is_some()) {
                     return Ok(ctx);
                 }
                 last_partial = Some(ctx);

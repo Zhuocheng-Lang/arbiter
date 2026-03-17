@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -62,12 +61,7 @@ impl ProcessContext {
             .map(|args| {
                 let mut joined = args.join(" ");
                 if joined.len() > MAX_CMDLINE_BYTES {
-                    // Truncate at a char boundary to avoid splitting a UTF-8 sequence.
-                    let mut end = MAX_CMDLINE_BYTES;
-                    while !joined.is_char_boundary(end) {
-                        end -= 1;
-                    }
-                    joined.truncate(end);
+                    joined.truncate(truncate_to_char_boundary(&joined, MAX_CMDLINE_BYTES).len());
                 }
                 joined
             });
@@ -111,106 +105,21 @@ impl ProcessContext {
 
 pub struct Matcher {
     rules: Vec<Arc<ResolvedRule>>,
-    /// Exact name lookup: `name_lowercase` → sorted rule indices.
-    /// Covers the vast majority of named rules.
-    name_index: HashMap<String, Vec<u32>>,
-    /// Prefix lookup for truncated `comm` (kernel truncates to 15 chars):
-    /// `name_lowercase[..MAX_COMM_LEN]` → sorted rule indices.
-    /// Only populated for rules whose `name_lowercase.len() > MAX_COMM_LEN`.
-    prefix_index: HashMap<String, Vec<u32>>,
-    /// True if any rule has an empty name (must always be checked).
-    has_nameless: bool,
 }
 
 impl Matcher {
     pub fn new(rules: Vec<ResolvedRule>) -> Self {
-        let rules: Vec<_> = rules.into_iter().map(Arc::new).collect();
-        let mut name_index: HashMap<String, Vec<u32>> = HashMap::with_capacity(rules.len());
-        let mut prefix_index: HashMap<String, Vec<u32>> = HashMap::new();
-        let mut has_nameless = false;
-
-        for (i, rule) in rules.iter().enumerate() {
-            if rule.name.is_empty() {
-                has_nameless = true;
-            } else {
-                name_index
-                    .entry(rule.name_lowercase.clone())
-                    .or_default()
-                    .push(i as u32);
-                // Build prefix index for long names so truncated `comm` can still match.
-                if rule.name_lowercase.len() > MAX_COMM_LEN {
-                    let prefix =
-                        truncate_to_char_boundary(&rule.name_lowercase, MAX_COMM_LEN).to_string();
-                    prefix_index.entry(prefix).or_default().push(i as u32);
-                }
-            }
-        }
-
-        Self {
-            rules,
-            name_index,
-            prefix_index,
-            has_nameless,
-        }
+        let rules = rules.into_iter().map(Arc::new).collect();
+        Self { rules }
     }
 
     /// Return the first rule that matches `ctx`, or `None`.
     ///
-    /// When no nameless rules exist (the common case — the loader rejects
-    /// empty-name entries), the name index is used to collect only the rule
-    /// indices that share a name with this process.  Those candidates are
-    /// checked in their original order (first-match-wins).  Processes that
-    /// match no indexed name are rejected in O(1) without any rule iteration.
-    ///
-    /// Falls back to a full O(n) scan only when nameless rules are present,
-    /// because a nameless rule can match any process at any list position.
     pub fn find_match(&self, ctx: &ProcessContext) -> Option<Arc<ResolvedRule>> {
-        // Nameless rules can match any process; full scan required for ordering.
-        if self.has_nameless {
-            return self
-                .rules
-                .iter()
-                .find(|rule| self.rule_matches(rule.as_ref(), ctx))
-                .cloned();
-        }
-
-        // Collect candidate indices for every name that could match this
-        // context.  Each Vec in the index was built by iterating rules in
-        // ascending order, so merging + sort_unstable + dedup preserves the
-        // original rule priority (first-match-wins).
-        let comm_lc = &ctx.comm_lowercase;
-        let mut candidates: Vec<u32> = Vec::new();
-
-        if let Some(indices) = self.name_index.get(comm_lc.as_str()) {
-            candidates.extend_from_slice(indices);
-        }
-        if ctx.comm.len() >= MAX_COMM_LEN
-            && let Some(indices) = self.prefix_index.get(comm_lc.as_str())
-        {
-            candidates.extend_from_slice(indices);
-        }
-        if let Some(exe_lc) = ctx.exe_name_lowercase.as_deref() {
-            // Skip when exe basename equals comm — already covered by the
-            // lookup above; avoids duplicate entries before dedup.
-            if exe_lc != comm_lc.as_str()
-                && let Some(indices) = self.name_index.get(exe_lc)
-            {
-                candidates.extend_from_slice(indices);
-            }
-        }
-
-        if candidates.is_empty() {
-            return None;
-        }
-
-        candidates.sort_unstable();
-        candidates.dedup();
-
-        candidates.iter().find_map(|&idx| {
-            let rule = &self.rules[idx as usize];
-            self.rule_matches(rule.as_ref(), ctx)
-                .then(|| Arc::clone(rule))
-        })
+        self.rules
+            .iter()
+            .find(|rule| self.rule_matches(rule.as_ref(), ctx))
+            .cloned()
     }
 
     /// Describe the matching process for debugging.
