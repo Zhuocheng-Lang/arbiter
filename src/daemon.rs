@@ -2,17 +2,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::signal::unix::{signal, SignalKind};
-use tokio::sync::{mpsc, RwLock};
+use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::{RwLock, mpsc};
 
 use crate::applier::Applier;
 use crate::config::Config;
-use crate::platform::linux::{self, start_event_stream, ProcEvent};
+use crate::platform::linux::{self, ProcEvent, start_event_stream};
 use crate::rules::{Matcher, ProcessContext, RuleSet};
 
 mod actor;
 
-use actor::{spawn_exec_dispatcher, DaemonActor, DaemonMessage, EXEC_QUEUE_CAPACITY};
+use actor::{DaemonActor, DaemonMessage, EXEC_QUEUE_CAPACITY, spawn_exec_dispatcher};
 
 // ── Daemon ────────────────────────────────────────────────────────────────────
 
