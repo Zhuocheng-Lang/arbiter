@@ -1,6 +1,6 @@
 # Arbiter 部署指南
 
-本文档说明如何在配合 CachyOS `ananicy-rules` 官方规则集的情况下，将 arbiter 部署为系统级进程优先级管理守护进程。
+本文档说明如何结合 CachyOS `ananicy-rules` 官方规则集，将 Arbiter 部署为系统级进程优先级管理守护进程。
 
 ---
 
@@ -9,31 +9,32 @@
 1. [前置要求](#前置要求)
 2. [编译](#编译)
 3. [安装规则集](#安装规则集)
-4. [配置](#配置)
-5. [静态校验](#静态校验)
-6. [运行守护进程](#运行守护进程)
-7. [systemd 服务](#systemd-服务)
-8. [热重载规则](#热重载规则)
-9. [调试与验证](#调试与验证)
-10. [兼容性说明](#兼容性说明)
-11. [卸载](#卸载)
+4. [如何用 arbiter 运行 ananicy-rules](#如何用-arbiter-运行-ananicy-rules)
+5. [配置](#配置)
+6. [静态校验](#静态校验)
+7. [运行守护进程](#运行守护进程)
+8. [systemd 服务](#systemd-服务)
+9. [热重载规则](#热重载规则)
+10. [调试与验证](#调试与验证)
+11. [兼容性说明](#兼容性说明)
+12. [卸载](#卸载)
 
 ---
 
 ## 前置要求
 
-| 要求        | 说明                                                                                                 |
-| ----------- | ---------------------------------------------------------------------------------------------------- |
-| Linux 内核  | ≥ 6.12（含 `sched_ext` BPF 框架；无 scx 调度器时也可正常工作）                                       |
-| cgroup v2   | 统一层级（`/sys/fs/cgroup`），现代发行版默认已启用                                                   |
-| 权限        | `CAP_NET_ADMIN`（读取 `CN_PROC` 进程事件）+ `CAP_SYS_NICE`（调整 nice/ionice），或直接以 `root` 运行 |
-| Rust 工具链 | 见 `rust-toolchain.toml`，建议使用 [uv](https://docs.astral.sh/uv/) 或 `rustup` 管理                 |
+| 要求        | 说明                                                                                                                                     |
+| ----------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Linux 内核  | ≥ 6.12（含 `sched_ext` BPF 框架；无 scx 调度器时也可正常工作）                                                                           |
+| cgroup v2   | 统一层级（`/sys/fs/cgroup`），现代发行版默认已启用                                                                                       |
+| 权限        | `CAP_NET_ADMIN`（读取 `CN_PROC` 进程事件）+ `CAP_SYS_NICE`（调整 `nice`；cgroup 写入仍需要相应的 cgroup 访问权限），或直接以 `root` 运行 |
+| Rust 工具链 | 见 `rust-toolchain.toml`，建议使用 [uv](https://docs.astral.sh/uv/) 或 `rustup` 管理                                                     |
 
 验证 cgroup v2：
 
 ```sh
 stat -f /sys/fs/cgroup | grep Type
-# 输出含 cgroup2 即为 v2
+# 输出包含 cgroup2 即表示使用的是 v2
 ```
 
 ---
@@ -95,18 +96,106 @@ mkdir -p ~/.config/arbiter/rules.d
 cp rules/*.types rules/*.rules ~/.config/arbiter/rules.d/
 ```
 
-两个目录都配置时均会加载；**同名规则以文件系统中先被 glob 到的为准**（同目录内按文件名字母序）。
+两个目录都配置时都会加载。对每个目录来说，arbiter 会先按字母序加载 `*.types`，再按字母序加载 `*.rules`；真正决定命中优先级的是规则顺序加上 first-match-wins，而不是额外的“覆盖”阶段。
+
+---
+
+## 如何用 arbiter 运行 ananicy-rules
+
+`arbiter` 的目标是复用 `ananicy-rules` 这套社区维护的规则资产，而不是复刻 `ananicy-cpp` 的整个运行模型。对部署者来说，最重要的结论是：
+
+- `arbiter` 会读取 `*.types` 和 `*.rules`
+- `arbiter` 会对 `*.cgroups` 给出警告并忽略
+- `arbiter` 依靠 `PROC_EVENT_EXEC` 事件驱动应用规则，而不是周期扫描
+- `arbiter` 应该替代 `ananicy-cpp` 运行，而不是和它并行共存
+
+### 实际会加载哪些文件
+
+对每一个配置的规则目录，`arbiter` 都按以下顺序处理：
+
+1. 按文件名字母序加载全部 `*.types`
+2. 按文件名字母序加载全部 `*.rules`
+3. 发现 `*.cgroups` 时只记录诊断并跳过
+
+这保证了类型定义一定先于规则解析完成。同时也意味着规则顺序本身有语义：`arbiter` 使用 first-match-wins，较早命中的选择器会遮蔽后面的重复选择器。
+
+### 在 arbiter 语境下，“运行 ananicy-rules”是什么意思
+
+这里的“运行”实际上包含两层含义：
+
+1. 继承 CachyOS / Ananicy-cpp 社区维护的进程分类与优先级经验
+2. 通过 `arbiter` 的事件驱动守护进程把这些规则真正应用到进程上
+
+在 `arbiter` 中，这条执行链路是：
+
+1. 某个进程执行 `execve`
+2. 内核发出 `PROC_EVENT_EXEC` netlink 事件
+3. `arbiter` 等待 `exec_delay_ms`，让 `/proc/<pid>` 状态稳定
+4. 匹配器读取 `comm`、exe basename、完整 exe 路径和 cmdline
+5. 选出第一条命中的已解析规则
+6. 写入 `nice`、`ionice`、`oom_score_adj`，以及可选的 cgroup 放置
+
+当规则选择了 cgroup 目标时，`ionice` 会被转换为 cgroup v2 `io.weight`，而不是直接调用 `ioprio_set()`。对应关系大致为：`RT` → `800-1000`，`BE` → `100-800`，`Idle` → `1-50`；如果没有 cgroup 目标，则会跳过这一步。
+
+因此它没有 `check_freq` 之类的扫描周期配置，因为它根本不是轮询式守护进程。
+
+### 上游规则中哪些内容不会直接生效
+
+最主要的不兼容点是 `00-cgroups.cgroups`。CachyOS 用这个文件表达 `CPUQuota` 之类的 cgroup 预设，而 `arbiter` 当前只支持把进程移入某个 cgroup，并可选写入 cgroup v2 的 `cpu.weight`。
+
+这里应当把它理解为模型差异，而不是导入失败：
+
+- `CPUQuota` 是硬上限
+- `cgroup_weight` 是相对份额
+- 两者语义不同，不能不经设计就自动互转
+
+另外，`sched` 这类字段会为兼容性而被解析，但在应用阶段被忽略；`latency_nice` 也不会生效。
+
+### 最小可行操作流程
+
+如果你要通过 `arbiter` 运行 CachyOS `ananicy-rules`，建议按下面的顺序执行：
+
+```sh
+# 1. 安装上游规则资产
+git clone https://github.com/CachyOS/ananicy-rules /tmp/ananicy-rules
+sudo mkdir -p /etc/arbiter/rules.d
+sudo cp /tmp/ananicy-rules/00-types.types /etc/arbiter/rules.d/
+sudo find /tmp/ananicy-rules/00-default -name '*.rules' -exec sudo cp {} /etc/arbiter/rules.d/ \;
+
+# 2. 校验语法与类型引用
+arbiter check /etc/arbiter/rules.d
+
+# 3. 在正式运行前先检查目标会命中哪条规则
+arbiter explain firefox
+
+# 4. 先用 dry-run 观察而不改写系统状态
+sudo arbiter daemon --dry-run
+
+# 5. 确认无误后再正式运行
+sudo arbiter daemon
+```
+
+### 不要与 ananicy-cpp 同时运行
+
+两个守护进程都会尝试修改相近的进程属性。把它们一起运行，结果通常是 `nice`、`ionice` 等状态出现 last-writer-wins 的相互覆盖。
+
+如果决定切换到 `arbiter`，应先停用 `ananicy-cpp`：
+
+```sh
+sudo systemctl disable --now ananicy-cpp.service
+sudo systemctl enable --now arbiter.service
+```
 
 ---
 
 ## 配置
 
-arbiter 会按序查找配置文件，找到即停止：
+arbiter 会按顺序查找配置文件，找到即停止：
 
 1. `/etc/arbiter/config.toml`
 2. `$XDG_CONFIG_HOME/arbiter/config.toml`（通常为 `~/.config/arbiter/config.toml`）
 
-若均不存在，使用内置默认值。
+若两者都不存在，则使用内置默认值。
 
 ### 最小配置示例
 
@@ -116,7 +205,8 @@ arbiter 会按序查找配置文件，找到即停止：
 # 规则目录（可指定多个，按序加载）
 rules_dirs = [
     "/etc/arbiter/rules.d",
-    # 追加自定义规则目录（会覆盖同名规则）
+    # 追加自定义规则目录
+    # 由于 first-match-wins，较早命中的选择器可能遮蔽后面的规则
     # "/home/user/.config/arbiter/rules.d",
 ]
 
@@ -146,10 +236,12 @@ exec_delay_ms = 50
 
 ```toml
 rules_dirs = [
-    "/etc/arbiter/rules.d",          # CachyOS 官方规则
-    "/etc/arbiter/rules.local.d",    # 本地覆盖规则（优先级更高）
+    "/etc/arbiter/rules.d",       # 先加载 CachyOS 官方规则
+    "/etc/arbiter/rules.local.d", # 再加载本地规则
 ]
 ```
+
+如果你希望本地规则最终生效，不能只依赖目录顺序，还应让选择器更具体，或者移除前面会先命中的冲突规则。
 
 ---
 
@@ -347,20 +439,20 @@ arbiter status
 
 以下为 CachyOS `ananicy-rules` 字段与 arbiter 的支持情况：
 
-| 字段                             | CachyOS 用法                                  | arbiter | 说明                                                 |
-| -------------------------------- | --------------------------------------------- | ------- | ---------------------------------------------------- |
-| `name`                           | 进程名                                        | ✅      | 匹配 `comm`（≤15 字符）或 exe basename，大小写不敏感 |
-| `type`                           | 类型继承                                      | ✅      | 引用 `.types` 中的预设，rule 字段覆盖 type 默认值    |
-| `nice`                           | -20~19                                        | ✅      | `setpriority()` 实现，clamp 到 [-20, 19]             |
-| `ioclass`                        | `best-effort` / `idle` / `real-time` / `none` | ✅      | `ioprio_set()` 实现                                  |
-| `ionice`                         | 0~7                                           | ✅      | IO 优先级级别                                        |
-| `oom_score_adj`                  | -1000~1000                                    | ✅      | 写入 `/proc/<pid>/oom_score_adj`                     |
-| `cgroup`                         | systemd slice 名                              | ✅      | 写入 `/sys/fs/cgroup/<cgroup>/cgroup.procs`          |
-| `cgroup_weight`                  | CPU 权重                                      | ✅      | 写入 cgroup v2 `cpu.weight`，clamp 到 [1, 10000]     |
-| `sched`                          | 调度策略                                      | ⚠️ 忽略 | 字段可解析但不应用（round-trip 兼容）                |
-| `latency_nice`                   | 延迟 nice                                     | ❌ 忽略 | CachyOS 扩展字段，arbiter 不支持                     |
-| _(rule only)_ `exe_pattern`      | —                                             | ✅      | arbiter 扩展：对完整 exe 路径做正则匹配              |
-| _(rule only)_ `cmdline_contains` | —                                             | ✅      | arbiter 扩展：对 cmdline 做子串匹配                  |
+| 字段                             | CachyOS 用法                                  | arbiter | 说明                                                                                                   |
+| -------------------------------- | --------------------------------------------- | ------- | ------------------------------------------------------------------------------------------------------ |
+| `name`                           | 进程名                                        | ✅      | 匹配 `comm`（≤15 字符）或 exe basename，大小写不敏感                                                   |
+| `type`                           | 类型继承                                      | ✅      | 引用 `.types` 中的预设，rule 字段覆盖 type 默认值                                                      |
+| `nice`                           | -20~19                                        | ✅      | `setpriority()` 实现，clamp 到 [-20, 19]                                                               |
+| `ioclass`                        | `best-effort` / `idle` / `real-time` / `none` | ✅      | 映射为 cgroup v2 `io.weight`（结合 `ionice` 级别）                                                     |
+| `ionice`                         | 0~7                                           | ✅      | IO 优先级级别                                                                                          |
+| `oom_score_adj`                  | -1000~1000                                    | ✅      | 写入 `/proc/<pid>/oom_score_adj`                                                                       |
+| `cgroup`                         | systemd slice 名                              | ✅      | 写入 `/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/arbiter.slice/<cgroup>/cgroup.procs` |
+| `cgroup_weight`                  | CPU 权重                                      | ✅      | 写入 cgroup v2 `cpu.weight`，clamp 到 [1, 10000]                                                       |
+| `sched`                          | 调度策略                                      | ⚠️ 忽略 | 字段可解析但不应用（round-trip 兼容）                                                                  |
+| `latency_nice`                   | 延迟 nice                                     | ❌ 忽略 | CachyOS 扩展字段，arbiter 不支持                                                                       |
+| _(rule only)_ `exe_pattern`      | —                                             | ✅      | arbiter 扩展：对完整 exe 路径做正则匹配                                                                |
+| _(rule only)_ `cmdline_contains` | —                                             | ✅      | arbiter 扩展：对 cmdline 做子串匹配                                                                    |
 
 ### `.cgroups` 文件迁移
 

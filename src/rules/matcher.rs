@@ -32,7 +32,7 @@ pub struct ProcessContext {
     pub ppid: u32,
     /// Monotonic kernel start time from /proc/PID/stat, used to detect PID reuse.
     pub start_time_ticks: u64,
-    /// `comm` from /proc/PID/stat` (kernel-truncated to 15 chars).
+    /// `comm` from /proc/PID/stat (kernel-truncated to 15 chars).
     pub comm: String,
     /// Pre-computed lowercase of `comm`; avoids per-rule allocation in hot path.
     pub comm_lowercase: String,
@@ -136,11 +136,19 @@ impl Matcher {
         ExplainResult { matched, attempts }
     }
 
+    /// Apply the rule selector predicates in the same order they are stored.
+    ///
+    /// The selector is intentionally conjunctive: name matching establishes the
+    /// candidate set, and optional `exe_pattern` and `cmdline_contains` filters
+    /// must all succeed for the rule to apply.
     fn rule_matches(&self, rule: &ResolvedRule, ctx: &ProcessContext) -> bool {
         if !rule.name.is_empty() {
             let name_lc = &rule.name_lowercase;
             let comm_lc = &ctx.comm_lowercase;
 
+            // When `comm` is truncated to the kernel limit, accept a prefix
+            // match from a longer rule name so entries like `firefox-esr-binary`
+            // still match the observed 15-character process name.
             let comm_matches = comm_lc == name_lc
                 || (ctx.comm.len() >= MAX_COMM_LEN && name_lc.starts_with(comm_lc.as_str()));
 

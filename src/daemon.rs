@@ -2,19 +2,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use tokio::signal::unix::{SignalKind, signal};
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::signal::unix::{signal, SignalKind};
+use tokio::sync::{mpsc, RwLock};
 
 use crate::applier::Applier;
 use crate::config::Config;
-use crate::platform::linux::{self, ProcEvent, start_event_stream};
+use crate::platform::linux::{self, start_event_stream, ProcEvent};
 use crate::rules::{Matcher, ProcessContext, RuleSet};
 
-/// Maximum number of pending exec events buffered before new events are
-/// dropped under sustained burst load.
-const EXEC_QUEUE_CAPACITY: usize = 2048;
-/// Maximum number of exec events processed concurrently after dequeue.
-const EXEC_CONCURRENCY: usize = 32;
+mod actor;
+
+use actor::{spawn_exec_dispatcher, DaemonActor, DaemonMessage, EXEC_QUEUE_CAPACITY};
 
 // ── Daemon ────────────────────────────────────────────────────────────────────
 
@@ -28,141 +26,71 @@ impl Daemon {
     }
 
     pub async fn run(self) -> Result<()> {
-        // ── load rules ────────────────────────────────────────────────────────
         let ruleset = RuleSet::load_from_dirs(&self.config.rules_dirs)?;
         let resolved = ruleset.validate()?;
         tracing::info!(count = resolved.len(), "Rules loaded");
 
-        // ── build shared components ───────────────────────────────────────────
         let matcher = Arc::new(RwLock::new(Matcher::new(resolved)));
         let applier = Arc::new(Applier::new(self.config.clone()));
         let scheduler = Arc::new(linux::detect());
-        let delay_ms = self.config.exec_delay_ms;
-        let rules_dirs = self.config.rules_dirs.clone();
+        let actor = DaemonActor::new(
+            self.config.rules_dirs.clone(),
+            self.config.exec_delay_ms,
+            matcher,
+            applier,
+            scheduler,
+        );
 
-        tracing::info!(scheduler = %scheduler, profile = %self.config.profile, "Arbiter starting");
+        tracing::info!(scheduler = %actor.scheduler(), profile = %self.config.profile, "Arbiter starting");
 
-        // ── open proc-connector channel ───────────────────────────────────────
-        let (tx, mut rx) = mpsc::channel::<ProcEvent>(EXEC_QUEUE_CAPACITY);
-        start_event_stream(tx).await?;
+        let (proc_tx, mut proc_rx) = mpsc::channel::<ProcEvent>(EXEC_QUEUE_CAPACITY);
+        start_event_stream(proc_tx).await?;
 
-        // ── exec queue + concurrency limiter ─────────────────────────────────
-        // Keep the old bounded-queue semantics so short bursts can be absorbed
-        // without dropping immediately, but replace the contended
-        // Arc<Mutex<Receiver>> worker pattern with a single dequeue task and a
-        // semaphore-limited spawn model.
-        let (exec_tx, mut exec_rx) = mpsc::channel::<u32>(EXEC_QUEUE_CAPACITY);
-        let sem = Arc::new(Semaphore::new(EXEC_CONCURRENCY));
-        {
-            let m = Arc::clone(&matcher);
-            let a = Arc::clone(&applier);
-            let s = Arc::clone(&scheduler);
-            let sem = Arc::clone(&sem);
+        let (exec_tx, exec_rx) = mpsc::channel::<u32>(EXEC_QUEUE_CAPACITY);
+        let exec_worker = spawn_exec_dispatcher(
+            exec_rx,
+            actor.matcher(),
+            actor.applier(),
+            actor.scheduler_arc(),
+            actor.exec_delay_ms(),
+        );
 
-            tokio::spawn(async move {
-                while let Some(pid) = exec_rx.recv().await {
-                    let permit = match Arc::clone(&sem).acquire_owned().await {
-                        Ok(permit) => permit,
-                        Err(_) => break,
-                    };
-
-                    let m = Arc::clone(&m);
-                    let a = Arc::clone(&a);
-                    let s = Arc::clone(&s);
-                    tokio::spawn(async move {
-                        let _permit = permit;
-
-                        match load_process_context(pid, delay_ms).await {
-                            Ok(ctx) => {
-                                let rule = {
-                                    let guard = m.read().await;
-                                    guard.find_match(&ctx)
-                                };
-                                if let Some(rule) = rule {
-                                    if let Err(e) = a.apply(&ctx, rule.as_ref(), &s) {
-                                        tracing::warn!(pid, "apply failed: {e}");
-                                    }
-                                } else {
-                                    tracing::debug!(
-                                        pid,
-                                        comm = %ctx.comm,
-                                        "no rule matched"
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::trace!(pid, "proc read failed: {e}");
-                            }
-                        }
-                    });
-                }
-            });
-        }
-
-        // ── signal handlers ───────────────────────────────────────────────────
         let mut sig_term = signal(SignalKind::terminate())?;
         let mut sig_int = signal(SignalKind::interrupt())?;
         let mut sig_hup = signal(SignalKind::hangup())?;
 
         tracing::info!("Daemon running — waiting for process events");
 
-        // ── main loop ─────────────────────────────────────────────────────────
         loop {
             tokio::select! {
-                Some(event) = rx.recv() => {
-                    match event {
-                        ProcEvent::Exec { pid, .. } => {
-                            if exec_tx.try_send(pid).is_err() {
-                                    tracing::warn!(
-                                        pid,
-                                        capacity = EXEC_QUEUE_CAPACITY,
-                                        "exec queue full; dropping process event"
-                                    );
-                            }
-                        }
-
-                        ProcEvent::Fork { child_pid, .. } => {
-                            tracing::trace!(pid = child_pid, "fork");
-                        }
-
-                        ProcEvent::Exit { pid, exit_code } => {
-                            tracing::trace!(pid, exit_code, "exit");
-                        }
+                Some(event) = proc_rx.recv() => {
+                    if !actor.handle_message(DaemonMessage::Proc(event), &exec_tx).await {
+                        break;
                     }
                 }
 
                 _ = sig_hup.recv() => {
-                    tracing::info!("SIGHUP received — reloading rules");
-                    match RuleSet::load_from_dirs(&rules_dirs) {
-                        Ok(rs) => {
-                            let resolved = match rs.validate() {
-                                Ok(resolved) => resolved,
-                                Err(e) => {
-                                    tracing::error!("Rule reload validation failed, keeping existing rules: {e}");
-                                    continue;
-                                }
-                            };
-                            let count = resolved.len();
-                            *matcher.write().await = Matcher::new(resolved);
-                            tracing::info!(count, "Rules reloaded");
-                        }
-                        Err(e) => tracing::error!("Rule reload failed, keeping existing rules: {e}"),
-                    }
+                    actor.handle_message(DaemonMessage::ReloadRules, &exec_tx).await;
                 }
 
                 _ = sig_term.recv() => {
                     tracing::info!("SIGTERM received — shutting down");
-                    break;
+                    if !actor.handle_message(DaemonMessage::Shutdown, &exec_tx).await {
+                        break;
+                    }
                 }
 
                 _ = sig_int.recv() => {
                     tracing::info!("SIGINT received — shutting down");
-                    break;
+                    if !actor.handle_message(DaemonMessage::Shutdown, &exec_tx).await {
+                        break;
+                    }
                 }
             }
         }
 
         drop(exec_tx);
+        let _ = exec_worker.await;
 
         Ok(())
     }

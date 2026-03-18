@@ -9,25 +9,26 @@ This document describes how to deploy `arbiter` as a system-level process priori
 1. [Prerequisites](#prerequisites)
 2. [Compilation](#compilation)
 3. [Installing Rule Sets](#installing-rule-sets)
-4. [Configuration](#configuration)
-5. [Static Validation](#static-validation)
-6. [Running the Daemon](#running-the-daemon)
-7. [systemd Service](#systemd-service)
-8. [Hot Reloading Rules](#hot-reloading-rules)
-9. [Debugging and Verification](#debugging-and-verification)
-10. [Compatibility Notes](#compatibility-notes)
-11. [Uninstallation](#uninstallation)
+4. [Running ananicy-rules with arbiter](#running-ananicy-rules-with-arbiter)
+5. [Configuration](#configuration)
+6. [Static Validation](#static-validation)
+7. [Running the Daemon](#running-the-daemon)
+8. [systemd Service](#systemd-service)
+9. [Hot Reloading Rules](#hot-reloading-rules)
+10. [Debugging and Verification](#debugging-and-verification)
+11. [Compatibility Notes](#compatibility-notes)
+12. [Uninstallation](#uninstallation)
 
 ---
 
 ## Prerequisites
 
-| Requirement    | Description                                                                                                   |
-| -------------- | ------------------------------------------------------------------------------------------------------------- |
-| Linux Kernel   | ≥ 6.12 (includes `sched_ext` BPF framework; works even without scx schedulers)                                |
-| cgroup v2      | Unified hierarchy (`/sys/fs/cgroup`), enabled by default in modern distributions                              |
-| Permissions    | `CAP_NET_ADMIN` (to read `CN_PROC` process events) + `CAP_SYS_NICE` (to adjust nice/ionice), or run as `root` |
-| Rust Toolchain | See `rust-toolchain.toml`, recommended to use [uv](https://docs.astral.sh/uv/) or `rustup`                    |
+| Requirement    | Description                                                                                                                                      |
+| -------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Linux Kernel   | ≥ 6.12 (includes `sched_ext` BPF framework; works even without scx schedulers)                                                                   |
+| cgroup v2      | Unified hierarchy (`/sys/fs/cgroup`), enabled by default in modern distributions                                                                 |
+| Permissions    | `CAP_NET_ADMIN` (to read `CN_PROC` process events) + `CAP_SYS_NICE` (to adjust `nice`; cgroup writes still need cgroup access), or run as `root` |
+| Rust Toolchain | See `rust-toolchain.toml`, recommended to use [uv](https://docs.astral.sh/uv/) or `rustup`                                                       |
 
 To verify cgroup v2:
 
@@ -94,7 +95,95 @@ mkdir -p ~/.config/arbiter/rules.d
 cp rules/*.types rules/*.rules ~/.config/arbiter/rules.d/
 ```
 
-If both directories are configured, both will be loaded; **rules with the same name are prioritized by filesystem discovery order** (alphabetical order within the same directory).
+If both directories are configured, both will be loaded. Within each directory, `arbiter` sorts `*.types` and `*.rules` alphabetically before loading them. Match priority is then determined by rule order plus first-match-wins semantics, not by a separate override pass.
+
+---
+
+## Running ananicy-rules with arbiter
+
+`arbiter` is meant to reuse the `ananicy-rules` rule corpus, not to emulate the whole `ananicy-cpp` runtime model. The practical consequence is simple:
+
+- `arbiter` reads `*.types` and `*.rules`
+- `arbiter` ignores `*.cgroups` with a warning
+- `arbiter` applies matches on `PROC_EVENT_EXEC` events instead of periodic scans
+- `arbiter` must replace `ananicy-cpp`, not run beside it
+
+### What gets loaded
+
+For every configured rules directory, `arbiter` loads files in this order:
+
+1. All `*.types` files, sorted alphabetically
+2. All `*.rules` files, sorted alphabetically
+3. Any `*.cgroups` files are reported and skipped
+
+This means type definitions are always available before rule resolution begins. It also means rule order matters: `arbiter` uses first-match-wins semantics, so earlier matching selectors shadow later duplicates.
+
+### What “running ananicy-rules” means in arbiter
+
+When people say “run `ananicy-rules`”, they usually mean two separate things:
+
+1. Reuse the community-maintained process classification from CachyOS and Ananicy-cpp
+2. Execute it through `arbiter`'s event-driven daemon
+
+In `arbiter`, that execution path is:
+
+1. A process calls `execve`
+2. The kernel emits a `PROC_EVENT_EXEC` netlink event
+3. `arbiter` waits `exec_delay_ms` to let `/proc/<pid>` settle
+4. The matcher reads `comm`, exe basename, full exe path, and cmdline
+5. The first matching resolved rule is applied
+6. `nice`, `ionice`, `oom_score_adj`, and optional cgroup placement are written
+
+When a rule selects a cgroup target, `ionice` is translated into cgroup v2 `io.weight` instead of calling `ioprio_set()` directly. The practical mapping is `RT` → `800-1000`, `BE` → `100-800`, and `Idle` → `1-50`; if no cgroup target is present, the `ionice` hint is skipped.
+
+There is no `check_freq` equivalent because `arbiter` is not a polling daemon.
+
+### Unsupported parts of the upstream rule set
+
+The main incompatibility is `00-cgroups.cgroups`. CachyOS uses that file for cgroup presets such as `CPUQuota`, while `arbiter` only supports moving a process into a cgroup and optionally writing cgroup v2 `cpu.weight`.
+
+Treat this as a model difference, not a failed import:
+
+- `CPUQuota` is a hard cap
+- `cgroup_weight` is a relative share
+- they are not interchangeable without manual policy decisions
+
+Fields such as `sched` are parsed for compatibility but ignored at apply time. `latency_nice` is also ignored.
+
+### Minimal workflow
+
+Use this sequence when deploying CachyOS `ananicy-rules` through `arbiter`:
+
+```sh
+# 1. Install the upstream rule assets
+git clone https://github.com/CachyOS/ananicy-rules /tmp/ananicy-rules
+sudo mkdir -p /etc/arbiter/rules.d
+sudo cp /tmp/ananicy-rules/00-types.types /etc/arbiter/rules.d/
+sudo find /tmp/ananicy-rules/00-default -name '*.rules' -exec sudo cp {} /etc/arbiter/rules.d/ \;
+
+# 2. Validate syntax and type references
+arbiter check /etc/arbiter/rules.d
+
+# 3. Inspect a likely target before going live
+arbiter explain firefox
+
+# 4. Confirm runtime behavior without writing system state
+sudo arbiter daemon --dry-run
+
+# 5. Start the real daemon once the matches look correct
+sudo arbiter daemon
+```
+
+### Do not run arbiter together with ananicy-cpp
+
+Both daemons try to manage overlapping process attributes. Running them together leads to last-writer-wins behavior on `nice`, `ionice`, and related state.
+
+If you switch to `arbiter`, disable `ananicy-cpp` first:
+
+```sh
+sudo systemctl disable --now ananicy-cpp.service
+sudo systemctl enable --now arbiter.service
+```
 
 ---
 
@@ -115,7 +204,8 @@ If neither exists, built-in default values are used.
 # Rules directories (multiple can be specified, loaded in order)
 rules_dirs = [
     "/etc/arbiter/rules.d",
-    # Append custom rules directory (will override duplicate names)
+    # Append custom rules directory
+    # Earlier matching selectors can shadow later ones because first-match-wins
     # "/home/user/.config/arbiter/rules.d",
 ]
 
@@ -145,10 +235,12 @@ Layer CachyOS rules with local overrides:
 
 ```toml
 rules_dirs = [
-    "/etc/arbiter/rules.d",          # Official CachyOS rules
-    "/etc/arbiter/rules.local.d",    # Local override rules (higher priority)
+  "/etc/arbiter/rules.d",       # Official CachyOS rules loaded first
+  "/etc/arbiter/rules.local.d", # Local rules loaded after them
 ]
 ```
+
+When you need a local rule to win, make its selector more specific or remove the earlier conflicting selector. Directory order alone does not invert first-match-wins behavior.
 
 ---
 
@@ -345,20 +437,20 @@ arbiter status
 
 Support status for CachyOS `ananicy-rules` fields in `arbiter`:
 
-| Field                            | CachyOS Usage                                 | arbiter    | Description                                                        |
-| -------------------------------- | --------------------------------------------- | ---------- | ------------------------------------------------------------------ |
-| `name`                           | Process name                                  | ✅         | Matches `comm` (≤15 chars) or exe basename, case-insensitive       |
-| `type`                           | Type inheritance                              | ✅         | References presets in `.types`; rule fields override type defaults |
-| `nice`                           | -20 to 19                                     | ✅         | Implemented via `setpriority()`, clamped to [-20, 19]              |
-| `ioclass`                        | `best-effort` / `idle` / `real-time` / `none` | ✅         | Implemented via `ioprio_set()`                                     |
-| `ionice`                         | 0 to 7                                        | ✅         | IO priority level                                                  |
-| `oom_score_adj`                  | -1000 to 1000                                 | ✅         | Writes to `/proc/<pid>/oom_score_adj`                              |
-| `cgroup`                         | systemd slice name                            | ✅         | Writes to `/sys/fs/cgroup/<cgroup>/cgroup.procs`                   |
-| `cgroup_weight`                  | CPU weight                                    | ✅         | Writes to cgroup v2 `cpu.weight`, clamped to [1, 10000]            |
-| `sched`                          | Scheduling policy                             | ⚠️ Ignored | Parsed but not applied (round-trip compatibility)                  |
-| `latency_nice`                   | Latency nice                                  | ❌ Ignored | CachyOS extension field, unsupported                               |
-| _(rule only)_ `exe_pattern`      | —                                             | ✅         | arbiter extension: regex match on full exe path                    |
-| _(rule only)_ `cmdline_contains` | —                                             | ✅         | arbiter extension: substring match on cmdline                      |
+| Field                            | CachyOS Usage                                 | arbiter    | Description                                                                                                 |
+| -------------------------------- | --------------------------------------------- | ---------- | ----------------------------------------------------------------------------------------------------------- |
+| `name`                           | Process name                                  | ✅         | Matches `comm` (≤15 chars) or exe basename, case-insensitive                                                |
+| `type`                           | Type inheritance                              | ✅         | References presets in `.types`; rule fields override type defaults                                          |
+| `nice`                           | -20 to 19                                     | ✅         | Implemented via `setpriority()`, clamped to [-20, 19]                                                       |
+| `ioclass`                        | `best-effort` / `idle` / `real-time` / `none` | ✅         | Mapped to cgroup v2 `io.weight` (with `ionice` level)                                                       |
+| `ionice`                         | 0 to 7                                        | ✅         | IO priority level                                                                                           |
+| `oom_score_adj`                  | -1000 to 1000                                 | ✅         | Writes to `/proc/<pid>/oom_score_adj`                                                                       |
+| `cgroup`                         | systemd slice name                            | ✅         | Writes to `/sys/fs/cgroup/user.slice/user-$UID.slice/user@$UID.service/arbiter.slice/<cgroup>/cgroup.procs` |
+| `cgroup_weight`                  | CPU weight                                    | ✅         | Writes to cgroup v2 `cpu.weight`, clamped to [1, 10000]                                                     |
+| `sched`                          | Scheduling policy                             | ⚠️ Ignored | Parsed but not applied (round-trip compatibility)                                                           |
+| `latency_nice`                   | Latency nice                                  | ❌ Ignored | CachyOS extension field, unsupported                                                                        |
+| _(rule only)_ `exe_pattern`      | —                                             | ✅         | arbiter extension: regex match on full exe path                                                             |
+| _(rule only)_ `cmdline_contains` | —                                             | ✅         | arbiter extension: substring match on cmdline                                                               |
 
 ### `.cgroups` File Migration
 
