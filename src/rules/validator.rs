@@ -99,10 +99,10 @@ impl RuleSet {
 fn check_rule_semantics(r: &ResolvedRule) -> bool {
     let mut ok = true;
 
-    if let Some(nice) = r.nice {
-        if !(-20..=19).contains(&nice) {
-            tracing::warn!("Rule '{}': nice {} out of bounds", r.name, nice);
-        }
+    if let Some(nice) = r.nice
+        && !(-20..=19).contains(&nice)
+    {
+        tracing::warn!("Rule '{}': nice {} out of bounds", r.name, nice);
     }
 
     if let Some(ionice) = r.ionice {
@@ -114,10 +114,10 @@ fn check_rule_semantics(r: &ResolvedRule) -> bool {
         }
     }
 
-    if let Some(oom) = r.oom_score_adj {
-        if !(-1000..=1000).contains(&oom) {
-            tracing::warn!("Rule '{}': oom_score_adj {} out of bounds", r.name, oom);
-        }
+    if let Some(oom) = r.oom_score_adj
+        && !(-1000..=1000).contains(&oom)
+    {
+        tracing::warn!("Rule '{}': oom_score_adj {} out of bounds", r.name, oom);
     }
 
     if let Some(cw) = r.cgroup_weight {
@@ -131,11 +131,11 @@ fn check_rule_semantics(r: &ResolvedRule) -> bool {
         }
     }
 
-    if let Some(cg) = &r.cgroup {
-        if cg.is_empty() || cg.starts_with('/') || cg.contains("..") {
-            tracing::error!("Rule '{}': invalid cgroup path '{}'", r.name, cg);
-            ok = false;
-        }
+    if let Some(cg) = &r.cgroup
+        && (cg.is_empty() || cg.starts_with('/') || cg.contains(".."))
+    {
+        tracing::error!("Rule '{}': invalid cgroup path '{}'", r.name, cg);
+        ok = false;
     }
 
     if !r.has_effects() {
